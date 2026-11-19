@@ -1,0 +1,19 @@
+[package]
+name = "picalens"
+version = "0.0.1"
+edition = "2024"
+rust-version = "1.89"
+
+[dependencies]
+adw = { package = "libadwaita", version = "0.8", features = ["v1_4"] }
+ashpd = { version = "0.12", default-features = false, features = ["async-std", "gtk4_wayland"] }
+gtk = { package = "gtk4", version = "0.10", features = ["v4_8"] }
+futures-channel = "0.3"
+futures-util = "0.3"
+libc = "0.2"
+pipewire = "0.9"
+reis = "0.7.1"
+
+[[bin]]
+name = "picalens-probe"
+path = "src/main.rs"
