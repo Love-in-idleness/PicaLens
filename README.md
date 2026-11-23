@@ -16,7 +16,7 @@ sudo apt install ./picalens_0.0.2-1ubuntu26.10_amd64.deb
 
 在 Plasma 6 Wayland 会话中，系统 KWin 与包内后台匹配时，应用会自动启用交互模式。画面等比放大，可直接点击、滚动和使用键盘。原生 Wayland 和 XWayland 源窗使用同一入口。PicaLens 的安装及 KWin 的更新可独立进行。 [Plasma 构建与验收](docs/kwin-experiment.md)
 
-缺少兼容的 KWin 后台时，应用通过桌面的 ScreenCast Portal 打开仅显示画面的全屏预览，按 Esc 退出。该模式要求 Portal 提供窗口捕获和正在运行的 PipeWire。
+在 GNOME Wayland 上，从应用菜单打开 PicaLens，点击 **Choose Window…**，再在 GNOME 的系统对话框中选中窗口。PicaLens 通过 ScreenCast Portal 和 PipeWire 提供只读全屏预览，按 Esc 退出。缺少兼容后台的 Plasma 会话也使用这条路径。已用 v0.0.2 发布包在 GNOME 50.1 验证安装、选窗和预览。
 
 ## 开发构建
 
