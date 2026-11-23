@@ -1,0 +1,9 @@
+Upstream-Name: PicaLens
+Source: https://github.com/Love-in-idleness/PicaLens
+
+The source files in kwin/ marked GPL-2.0-or-later are distributed under the
+GNU General Public License, version 2 or any later version. On Debian the
+version 2 license is available in /usr/share/common-licenses/GPL-2.
+
+Licenses and attribution notices for bundled Rust dependencies are supplied
+in rust-dependencies.txt.gz in this directory.

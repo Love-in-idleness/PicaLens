@@ -120,6 +120,6 @@ cargo build --locked
 
 ## 合成器集成验证入口
 
-KWin 6.3.6 原生实验由合成器选择现有窗口、绘制放大画面并反算输入坐标。原生 Wayland 与桌面自带的 XWayland 均已在嵌套 KWin 的 QPainter 后端通过 100% 和 150% 缩放的输入对照。DRM/OpenGL 后端与 Portal 窗口流分别验收。 [KWin 插件构建与验收](kwin-experiment.md)
+在 Plasma 6 Wayland 会话中，从 `picalens` 或 `picalens toggle` 进入合成器交互模式。KWin 负责选窗、等比绘制和输入映射。原生 Wayland 与 XWayland 均已在嵌套 KWin 6.3.6 的 QPainter 后端通过 100% 和 150% 缩放的输入对照。DRM/OpenGL 后端与 Portal 窗口流分别验收。 [Plasma 构建与验收](kwin-experiment.md)
 
 Mutter 50.1 对窗口流的 EIS 绝对坐标做表面到舞台的坐标变换，然后向 Clutter 虚拟设备发送移动和按键。GNOME 50.1 实机类型绑定检查确认 Shell 可获取窗口演员、查询位置下的演员，并反算演员坐标。`Meta.WaylandPointer` 未从该版本的 GObject Introspection 暴露，设置 Wayland 指针焦点的函数位于 Mutter 内部。当前源码审查及实测尚未确认 Shell 扩展能将点击投给被覆盖的源面，不能据此开启该路径。 [窗口流坐标变换](https://github.com/GNOME/mutter/blob/50.1/src/backends/meta-screen-cast-window-stream.c#L321) · [EIS 事件提交](https://github.com/GNOME/mutter/blob/50.1/src/backends/meta-eis-client.c#L503) · [Wayland 指针焦点](https://github.com/GNOME/mutter/blob/50.1/src/wayland/meta-wayland-pointer.c#L1096)

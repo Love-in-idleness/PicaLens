@@ -15,7 +15,7 @@ use crate::{
 
 const ARM_TIME: Duration = Duration::from_secs(5);
 const FRESH_FRAME: Duration = Duration::from_secs(3);
-type StopSender = Rc<RefCell<Option<oneshot::Sender<&'static str>>>>;
+pub type StopSender = Rc<RefCell<Option<oneshot::Sender<&'static str>>>>;
 
 pub fn install_style(display: &gdk::Display) {
     let css = gtk::CssProvider::new();
@@ -323,23 +323,13 @@ impl Preview {
     }
 
     fn present_frame(&self, frame: Frame) -> Result<(), Box<dyn std::error::Error>> {
-        let width = i32::try_from(frame.width)?;
-        let height = i32::try_from(frame.height)?;
-        let stride = usize::try_from(frame.width)?
-            .checked_mul(4)
-            .ok_or("stride overflow")?;
-        if width == 0
-            || height == 0
-            || stride.checked_mul(frame.height as usize) != Some(frame.rgba.len())
-        {
-            return Err("invalid RGBA preview frame".into());
-        }
-        let mut state = self.state.borrow_mut();
         let picture = PictureGeometry {
             size: (frame.width, frame.height),
             stream_size: frame.stream_size,
             origin: frame.crop_origin,
         };
+        let texture = frame_texture(frame)?;
+        let mut state = self.state.borrow_mut();
         if state.frame.is_some_and(|old| old.picture != picture) {
             state.invalidate("source geometry changed");
         }
@@ -347,14 +337,31 @@ impl Preview {
             picture,
             received: Instant::now(),
         });
-        drop(state);
-
-        let bytes = glib::Bytes::from_owned(frame.rgba);
-        let texture =
-            gdk::MemoryTexture::new(width, height, gdk::MemoryFormat::R8g8b8a8, &bytes, stride);
         self.picture.set_paintable(Some(&texture));
         Ok(())
     }
+}
+
+pub fn frame_texture(frame: Frame) -> crate::session::Result<gdk::MemoryTexture> {
+    let width = i32::try_from(frame.width)?;
+    let height = i32::try_from(frame.height)?;
+    let stride = usize::try_from(frame.width)?
+        .checked_mul(4)
+        .ok_or("stride overflow")?;
+    if width == 0
+        || height == 0
+        || stride.checked_mul(frame.height as usize) != Some(frame.rgba.len())
+    {
+        return Err("invalid RGBA preview frame".into());
+    }
+    let bytes = glib::Bytes::from_owned(frame.rgba);
+    Ok(gdk::MemoryTexture::new(
+        width,
+        height,
+        gdk::MemoryFormat::R8g8b8a8,
+        &bytes,
+        stride,
+    ))
 }
 
 fn for_enter_and_motion(motion: &gtk::EventControllerMotion, state: &Rc<RefCell<State>>) {

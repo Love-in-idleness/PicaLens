@@ -2,6 +2,7 @@
 name = "picalens"
 version = "0.0.1"
 edition = "2024"
+default-run = "picalens"
 rust-version = "1.89"
 
 [dependencies]
@@ -13,7 +14,3 @@ futures-util = "0.3"
 libc = "0.2"
 pipewire = "0.9"
 reis = "0.7.1"
-
-[[bin]]
-name = "picalens-probe"
-path = "src/main.rs"

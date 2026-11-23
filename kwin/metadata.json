@@ -1,7 +1,7 @@
 {
     "KPlugin": {
         "Name": "PicaLens",
-        "Description": "Experimentally magnify a selected window in a Plasma Wayland session",
+        "Description": "Window magnification backend for the PicaLens application",
         "Category": "Accessibility",
         "EnabledByDefault": false,
         "License": "GPL-2.0-or-later",

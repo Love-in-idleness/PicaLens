@@ -3,9 +3,13 @@
 #include "inputfilter.h"
 #include "presentation.h"
 
-#include <KGlobalAccel>
-#include <QAction>
+#include <QDBusConnection>
+#include <QDBusContext>
+#include <QDBusMessage>
+#include <QDBusServiceWatcher>
 #include <QDebug>
+#include <QKeyEvent>
+#include <QMouseEvent>
 #include <QPointer>
 #include <QTimer>
 
@@ -18,19 +22,28 @@
 namespace KWin
 {
 
-class PicaLensEffect : public Effect
+static const QString backendPath = QStringLiteral("/io/github/LoveInIdleness/PicaLens/Backend");
+
+class PicaLensEffect : public Effect, protected QDBusContext
 {
+    Q_OBJECT
+    Q_CLASSINFO("D-Bus Interface", "io.github.LoveInIdleness.PicaLens.Backend1")
+
 public:
     PicaLensEffect()
     {
-        auto *toggleAction = new QAction(this);
-        toggleAction->setProperty("componentName", QStringLiteral("kwin"));
-        toggleAction->setObjectName(QStringLiteral("PicaLensToggle"));
-        toggleAction->setText(tr("Toggle PicaLens"));
-        const QList<QKeySequence> shortcuts = {QKeySequence(Qt::CTRL | Qt::META | Qt::Key_Y)};
-        KGlobalAccel::self()->setDefaultShortcut(toggleAction, shortcuts);
-        KGlobalAccel::self()->setShortcut(toggleAction, shortcuts);
-        connect(toggleAction, &QAction::triggered, this, &PicaLensEffect::toggle);
+        m_owner.setConnection(QDBusConnection::sessionBus());
+        m_owner.setWatchMode(QDBusServiceWatcher::WatchForUnregistration);
+        m_registered = QDBusConnection::sessionBus().registerObject(
+            backendPath, this, QDBusConnection::ExportScriptableSlots | QDBusConnection::ExportScriptableSignals);
+        if (!m_registered) {
+            qWarning("picalens could not register its backend");
+        }
+        connect(&m_owner, &QDBusServiceWatcher::serviceUnregistered, this, [this](const QString &service) {
+            if (m_owner.watchedServices().contains(service)) {
+                stop("PicaLens disconnected");
+            }
+        });
         m_activationTimer.setSingleShot(true);
         connect(&m_activationTimer, &QTimer::timeout, this, [this] {
             stop("source activation timed out");
@@ -68,7 +81,8 @@ public:
             stop("output geometry changed");
         });
         connect(effects, &EffectsHandler::activeFullScreenEffectChanged, this, [this] {
-            if (m_presentation && effects->activeFullScreenEffect() != this) {
+            if ((m_selecting || m_pendingActivation || m_presentation)
+                && effects->activeFullScreenEffect() != this) {
                 stop("another fullscreen effect took over");
             }
         });
@@ -78,6 +92,9 @@ public:
     ~PicaLensEffect() override
     {
         stop("effect unloaded");
+        if (m_registered) {
+            QDBusConnection::sessionBus().unregisterObject(backendPath);
+        }
     }
 
     bool isActive() const override
@@ -117,29 +134,69 @@ public:
         }
     }
 
-private:
-    void toggle()
+    void windowInputMouseEvent(QEvent *event) override
     {
-        if (m_presentation || m_pendingActivation) {
-            stop("shortcut");
+        if (!m_selecting || event->type() != QEvent::MouseButtonRelease) {
             return;
         }
-        if (m_selecting || effects->isScreenLocked() || effects->activeFullScreenEffect()) {
-            return;
-        }
-        m_selecting = true;
-        qInfo("picalens selecting an existing window");
-        effects->startInteractiveWindowSelection([effect = QPointer(this)](EffectWindow *window) {
-            if (!effect || !effect->m_selecting) {
-                return;
-            }
-            effect->m_selecting = false;
-            if (window) {
-                effect->activate(window);
+        const auto *mouse = static_cast<QMouseEvent *>(event);
+        if (mouse->button() == Qt::RightButton) {
+            stop("selection cancelled", true);
+        } else if (mouse->button() == Qt::LeftButton && mouse->buttons() == Qt::NoButton) {
+            endSelection();
+            // KWin suppresses normal hit testing during mouse interception.
+            auto *window = input()->findToplevel(mouse->globalPosition());
+            auto *effectWindow = window ? window->effectWindow() : nullptr;
+            if (effectWindow && eligible(effectWindow)) {
+                activate(effectWindow);
             } else {
-                qInfo("picalens selection cancelled");
+                stop("no eligible window selected", true);
             }
-        });
+        }
+    }
+
+    void grabbedKeyboardEvent(QKeyEvent *event) override
+    {
+        if (m_selecting && event->type() == QEvent::KeyRelease && event->key() == Qt::Key_Escape) {
+            stop("selection cancelled", true);
+        }
+    }
+
+public Q_SLOTS:
+    Q_SCRIPTABLE bool Start()
+    {
+        if (!calledFromDBus() || !m_owner.watchedServices().isEmpty()
+            || effects->isScreenLocked() || effects->activeFullScreenEffect()
+            || effects->isMouseInterception() || input()->isSelectingWindow()
+            || !effects->grabKeyboard(this)) {
+            return false;
+        }
+        m_owner.addWatchedService(message().service());
+        m_selecting = true;
+        effects->startMouseInterception(this, Qt::CrossCursor);
+        qInfo("picalens selecting an existing window");
+        return true;
+    }
+
+    Q_SCRIPTABLE void Stop()
+    {
+        if (calledFromDBus() && m_owner.watchedServices().contains(message().service())) {
+            stop("PicaLens requested stop");
+        }
+    }
+
+Q_SIGNALS:
+    Q_SCRIPTABLE void Finished(const QString &reason, bool returnToControls);
+
+private:
+    void endSelection()
+    {
+        if (!m_selecting) {
+            return;
+        }
+        m_selecting = false;
+        effects->stopMouseInterception(this);
+        effects->ungrabKeyboard();
     }
 
     bool eligible(EffectWindow *window) const
@@ -152,13 +209,9 @@ private:
 
     void activate(EffectWindow *window)
     {
-        if (!eligible(window)) {
-            qInfo("picalens rejected ineligible window");
-            return;
-        }
         m_pendingActivation = window;
         m_activationTimer.start(1500);
-        // KWin calls the selection callback before releasing its keyboard grab.
+        // Let KWin finish dispatching the selection click before moving focus.
         // XWayland then confirms activation asynchronously.
         QTimer::singleShot(0, this, [this, selected = QPointer(window)] {
             if (!selected || m_pendingActivation != selected) {
@@ -176,13 +229,13 @@ private:
         m_pendingActivation.clear();
         m_activationTimer.stop();
         if (!eligible(window)) {
-            qInfo("picalens rejected ineligible window");
+            stop("selected window is no longer eligible");
             return;
         }
         auto *source = window->window();
         auto presentation = PicaLens::presentationFor(window);
         if (!source->surface() || !presentation) {
-            qInfo("picalens rejected window without a usable presentation");
+            stop("window has no usable presentation");
             return;
         }
 
@@ -218,14 +271,22 @@ private:
                           << presentation->destination << " output=" << presentation->outputRect;
     }
 
-    void stop(const char *reason)
+    void stop(const char *reason, bool returnToControls = false)
     {
-        m_selecting = false;
-        m_activationTimer.stop();
-        if (m_pendingActivation) {
-            m_pendingActivation.clear();
-            qInfo("picalens activation cancelled: %s", reason);
+        if (m_owner.watchedServices().isEmpty()) {
+            return;
         }
+        m_owner.setWatchedServices({});
+        endSelection();
+        m_activationTimer.stop();
+        m_pendingActivation.clear();
+        clearPresentation();
+        qInfo("picalens stopped: %s", reason);
+        Q_EMIT Finished(QString::fromLatin1(reason), returnToControls);
+    }
+
+    void clearPresentation()
+    {
         if (!m_presentation) {
             return;
         }
@@ -247,15 +308,16 @@ private:
             effects->setActiveFullScreenEffect(nullptr);
         }
         effects->addRepaint(repaint);
-        qInfo("picalens stopped: %s", reason);
     }
 
     QPointer<EffectWindow> m_window;
     QPointer<EffectWindow> m_pendingActivation;
     QPointer<Window> m_source;
     QTimer m_activationTimer;
+    QDBusServiceWatcher m_owner;
     std::optional<PicaLens::Presentation> m_presentation;
     PicaLensInputFilter m_input;
+    bool m_registered = false;
     bool m_selecting = false;
     bool m_firstPaint = false;
     bool m_failedPaint = false;

@@ -6,7 +6,6 @@ list(APPEND CMAKE_MODULE_PATH ${ECM_MODULE_PATH})
 include(KDEInstallDirs)
 
 find_package(Qt6 6.8 REQUIRED COMPONENTS DBus Widgets)
-find_package(KF6GlobalAccel 6.13 REQUIRED)
 find_package(KWin 6.3.6 EXACT REQUIRED CONFIG)
 
 set(CMAKE_CXX_STANDARD 23)
@@ -17,5 +16,5 @@ list(APPEND CMAKE_AUTOMOC_MACRO_NAMES KWIN_EFFECT_FACTORY_SUPPORTED_ENABLED)
 
 add_library(picalens MODULE effect.cpp presentation.cpp inputfilter.cpp)
 set_target_properties(picalens PROPERTIES PREFIX "")
-target_link_libraries(picalens PRIVATE KWin::kwin Qt6::Widgets KF6::GlobalAccel)
+target_link_libraries(picalens PRIVATE KWin::kwin Qt6::DBus Qt6::Widgets)
 install(TARGETS picalens LIBRARY DESTINATION "${KDE_INSTALL_PLUGINDIR}/kwin/effects/plugins")

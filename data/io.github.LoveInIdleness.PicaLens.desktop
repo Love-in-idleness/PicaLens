@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PicaLens
+Name[zh_CN]=PicaLens（鹊镜）
+Comment=Magnify an open window
+Comment[zh_CN]=放大已打开的窗口
+Exec=picalens
+TryExec=picalens
+Icon=zoom-in
+Terminal=false
+Categories=Utility;Accessibility;

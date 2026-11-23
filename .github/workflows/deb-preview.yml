@@ -1,0 +1,47 @@
+name: Debian preview
+
+on:
+  push:
+    tags: [v0.0.1]
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LANG: C.UTF-8
+    steps:
+      - name: Install Debian build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            g++ git curl ca-certificates cmake ninja-build dpkg-dev extra-cmake-modules gh \
+            kwin-dev kwin-wayland libadwaita-1-dev libclang-dev libgtk-4-dev \
+            libpipewire-0.3-dev libwayland-dev libxkbcommon-dev pkg-config python3
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Install Rust
+        run: |
+          curl --fail --silent --show-error --location https://sh.rustup.rs -o /tmp/rustup-init.sh
+          sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.100.0 --no-modify-path
+          printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+      - name: Build and check the package
+        run: |
+          bash packaging/build-deb.sh
+          cd build/deb
+          sha256sum -c SHA256SUMS
+          dpkg-deb --info picalens_0.0.1-1_amd64.deb
+      - name: Publish the preview
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" \
+            build/deb/picalens_0.0.1-1_amd64.deb build/deb/SHA256SUMS \
+            --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
+            --title "PicaLens 0.0.1 · Debian preview" \
+            --notes-file packaging/v0.0.1.md

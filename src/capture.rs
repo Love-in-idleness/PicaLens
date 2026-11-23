@@ -81,12 +81,12 @@ pub fn start(fd: OwnedFd, node_id: u32) -> io::Result<Capture> {
         .spawn(move || {
             let result = run(fd, node_id, stop_rx, &worker_mailbox);
             if let Err(error) = result {
-                eprintln!("PipeWire capture stopped: {error}");
+                diagnostic!("PipeWire capture stopped: {error}");
                 let mut mailbox = worker_mailbox.lock().unwrap();
                 mailbox.frame = None;
                 mailbox.error = Some(error.to_string());
             } else {
-                eprintln!("PipeWire capture stopped: requested shutdown");
+                diagnostic!("PipeWire capture stopped: requested shutdown");
             }
         })?;
     Ok(Capture {
@@ -172,7 +172,7 @@ fn run(
     .state_changed({
         let fail = Rc::clone(&fail);
         move |_, _, old, new| {
-            eprintln!("PipeWire stream state: {old:?} -> {new:?}");
+            diagnostic!("PipeWire stream state: {old:?} -> {new:?}");
             match new {
                 pw::stream::StreamState::Error(error) => fail(error),
                 pw::stream::StreamState::Unconnected
@@ -202,7 +202,7 @@ fn run(
             }) {
                 Ok(format) => {
                     let Rectangle { width, height } = format.size();
-                    eprintln!("PipeWire format: {:?}, {width}x{height}, {}/{} Hz",
+                    diagnostic!("PipeWire format: {:?}, {width}x{height}, {}/{} Hz",
                         format.format(), format.framerate().num, format.framerate().denom);
                     state.format = Some(format);
                 }
@@ -230,13 +230,13 @@ fn run(
                 Ok((frame, layout)) => {
                     let report = state.frames == 0 || state.last_report.elapsed() >= Duration::from_secs(1);
                     if state.layout.is_none() || (report && state.layout != Some(layout)) {
-                        eprintln!("PipeWire buffer: {:?}, stride={}, offset={}, crop={:?}, cursor=hidden",
+                        diagnostic!("PipeWire buffer: {:?}, stride={}, offset={}, crop={:?}, cursor=hidden",
                             layout.kind, layout.stride, layout.offset, layout.crop);
                         state.layout = Some(layout);
                     }
                     state.frames += 1;
                     if report {
-                        eprintln!("PipeWire frames received: {}", state.frames);
+                        diagnostic!("PipeWire frames received: {}", state.frames);
                         state.last_report = Instant::now();
                     }
                     // No PipeWire memory leaves the worker or remains mapped by the UI.
@@ -258,7 +258,7 @@ fn run(
             | pw::stream::StreamFlags::DONT_RECONNECT,
         &mut [pod_bytes(&format)],
     )?;
-    eprintln!("PipeWire remote capture requested for node {node_id}");
+    diagnostic!("PipeWire remote capture requested for node {node_id}");
     if failure.borrow().is_none() {
         mainloop.run();
     }

@@ -12,10 +12,11 @@ use ashpd::{
 };
 use futures_channel::oneshot;
 use futures_util::{FutureExt, StreamExt};
+use gtk::prelude::IsA;
 
 use crate::{capture::Capture, input::EisInput, preview::Preview};
 
-type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub type Stop = oneshot::Receiver<&'static str>;
 
 pub async fn diagnostics() -> Result<()> {
@@ -53,6 +54,47 @@ pub async fn diagnostics() -> Result<()> {
 }
 
 pub async fn run(view: &Preview, experiment: bool, stop: Stop) -> Result<&'static str> {
+    if !experiment {
+        return capture_window(Some(view.window.as_ref()), stop, |capture, size| {
+            view.show(capture, None, size)
+        })
+        .await;
+    }
+    let cast = window_portal().await?;
+    let remote = RemoteDesktop::new().await?;
+    let available = remote.available_device_types().await?;
+    if !available.contains(DeviceType::Pointer) {
+        return Err("RemoteDesktop does not advertise pointer access".into());
+    }
+    let devices = available & (DeviceType::Pointer | DeviceType::Keyboard);
+    let session = remote.create_session().await?;
+    with_session(&session, stop, async {
+        diagnostic!("portal RemoteDesktop.SelectDevices requested_devices={devices:?}");
+        remote
+            .select_devices(&session, devices, None, PersistMode::DoNot)
+            .await?
+            .response()?;
+        select_window(&cast, &session).await?;
+        let parent = parent(&view.window).await;
+        diagnostic!("portal RemoteDesktop.Start");
+        let selected = remote.start(&session, parent.as_ref()).await?.response()?;
+        let granted = selected.devices();
+        diagnostic!("portal granted_devices={granted:?}");
+        let stream = window_stream(selected.streams().unwrap_or_default())?;
+        let capture = open_capture(&cast, &session, stream).await?;
+        let input = match connect_input(&remote, &session, stream, granted).await {
+            Ok(input) => Some(input),
+            Err(error) => {
+                diagnostic!("input unavailable: {error}");
+                None
+            }
+        };
+        view.show(capture, input, stream.size()).await
+    })
+    .await
+}
+
+async fn window_portal() -> Result<Screencast<'static>> {
     let cast = Screencast::new().await?;
     if !cast
         .available_source_types()
@@ -62,56 +104,34 @@ pub async fn run(view: &Preview, experiment: bool, stop: Stop) -> Result<&'stati
         return Err("ScreenCast does not advertise window sources".into());
     }
 
-    if experiment {
-        let remote = RemoteDesktop::new().await?;
-        let available = remote.available_device_types().await?;
-        if !available.contains(DeviceType::Pointer) {
-            return Err("RemoteDesktop does not advertise pointer access".into());
-        }
-        let devices = available & (DeviceType::Pointer | DeviceType::Keyboard);
-        let session = remote.create_session().await?;
-        with_session(&session, stop, async {
-            eprintln!("portal RemoteDesktop.SelectDevices requested_devices={devices:?}");
-            remote
-                .select_devices(&session, devices, None, PersistMode::DoNot)
-                .await?
-                .response()?;
-            select_window(&cast, &session).await?;
-            let parent = parent(view).await;
-            eprintln!("portal RemoteDesktop.Start");
-            let selected = remote.start(&session, parent.as_ref()).await?.response()?;
-            let granted = selected.devices();
-            eprintln!("portal granted_devices={granted:?}");
-            let stream = window_stream(selected.streams().unwrap_or_default())?;
-            let capture = open_capture(&cast, &session, stream).await?;
-            let input = match connect_input(&remote, &session, stream, granted).await {
-                Ok(input) => Some(input),
-                Err(error) => {
-                    eprintln!("input unavailable: {error}");
-                    None
-                }
-            };
-            view.show(capture, input, stream.size()).await
-        })
-        .await
-    } else {
-        let session = cast.create_session().await?;
-        with_session(&session, stop, async {
-            select_window(&cast, &session).await?;
-            let parent = parent(view).await;
-            eprintln!("portal ScreenCast.Start");
-            let selected = cast.start(&session, parent.as_ref()).await?.response()?;
-            let stream = window_stream(selected.streams())?;
-            let capture = open_capture(&cast, &session, stream).await?;
-            view.show(capture, None, stream.size()).await
-        })
-        .await
-    }
+    Ok(cast)
 }
 
-async fn parent(view: &Preview) -> Option<WindowIdentifier> {
+pub async fn capture_window(
+    window: Option<&gtk::Native>,
+    stop: Stop,
+    show: impl AsyncFnOnce(Capture, Option<(i32, i32)>) -> Result<&'static str>,
+) -> Result<&'static str> {
+    let cast = window_portal().await?;
+    let session = cast.create_session().await?;
+    with_session(&session, stop, async {
+        select_window(&cast, &session).await?;
+        let parent = match window {
+            Some(window) => parent(window).await,
+            None => None,
+        };
+        diagnostic!("portal ScreenCast.Start");
+        let selected = cast.start(&session, parent.as_ref()).await?.response()?;
+        let stream = window_stream(selected.streams())?;
+        let capture = open_capture(&cast, &session, stream).await?;
+        show(capture, stream.size()).await
+    })
+    .await
+}
+
+async fn parent(window: &impl IsA<gtk::Native>) -> Option<WindowIdentifier> {
     let parent = futures_util::future::select(
-        Box::pin(WindowIdentifier::from_native(&view.window)),
+        Box::pin(WindowIdentifier::from_native(window)),
         glib_timeout(Duration::from_secs(2)),
     )
     .await;
@@ -119,7 +139,7 @@ async fn parent(view: &Preview) -> Option<WindowIdentifier> {
         futures_util::future::Either::Left((id, _)) => id,
         futures_util::future::Either::Right(_) => None,
     };
-    eprintln!("portal wayland_parent_exported={}", id.is_some());
+    diagnostic!("portal wayland_parent_exported={}", id.is_some());
     id
 }
 
@@ -152,8 +172,8 @@ async fn with_session<T: SessionPortal>(
         use futures_util::future::Either;
         match close {
             Either::Left((Ok(()), _)) => {}
-            Either::Left((Err(error), _)) => eprintln!("portal close: {error}"),
-            Either::Right(_) => eprintln!("portal close timed out"),
+            Either::Left((Err(error), _)) => diagnostic!("portal close: {error}"),
+            Either::Right(_) => diagnostic!("portal close timed out"),
         }
     }
     match result {
@@ -173,7 +193,7 @@ async fn select_window(
     cast: &Screencast<'_>,
     session: &Session<'_, impl HasScreencastSession>,
 ) -> Result<()> {
-    eprintln!("portal ScreenCast.SelectSources requested_source=Window");
+    diagnostic!("portal ScreenCast.SelectSources requested_source=Window");
     cast.select_sources(
         session,
         CursorMode::Hidden,
@@ -191,7 +211,7 @@ fn window_stream(streams: &[Stream]) -> Result<&Stream> {
     let [stream] = streams else {
         return Err(format!("expected one window stream, received {}", streams.len()).into());
     };
-    eprintln!(
+    diagnostic!(
         "portal requested_source=Window granted_source={:?} node={} logical_size={:?} mapping_id={:?}",
         stream.source_type(),
         stream.pipe_wire_node_id(),
