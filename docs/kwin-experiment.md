@@ -1,10 +1,10 @@
 # Plasma Wayland 交互后台
 
-PicaLens 通过 KWin 6.3.6 选择、放大并操作已有窗口。应用负责启动、取消和结束会话，KWin 负责绘制与输入。原生 Wayland 和桌面自带 XWayland 各验收一轮，源应用在整个过程保持运行。 [Portal 验证手册](verification.md)
+PicaLens 通过 KWin 选择、放大并操作已有窗口。应用负责启动、取消和结束会话，KWin 负责绘制与输入。后台支持 Debian 13 的 KWin 6.3.6 和 Ubuntu 26.10 的 KWin 6.7.5。原生 Wayland 和桌面自带 XWayland 各验收一轮，源应用在整个过程保持运行。 [Portal 验证手册](verification.md)
 
 ## 构建环境
 
-后台使用 KWin 6.3.6 的私有 C++ 接口。使用与目标会话的 KWin 二进制来自同一套发行版构建的开发包和运行库。构建需要 C++23、CMake ≥ 3.24、Ninja、Qt ≥ 6.8、ECM、libepoxy 和匹配的 KWin 开发包。发布验收使用具备 DRM 与 OpenGL 合成的 Wayland 会话，并启用 XWayland。
+后台使用 KWin 的私有 C++ 接口。使用与目标会话的 KWin 二进制来自同一套发行版构建的开发包和运行库。构建需要 C++23、CMake ≥ 3.24、Ninja、Qt ≥ 6.8、ECM、libepoxy 和匹配的 KWin 开发包。使用 KWin 6.7.5 时还需要 libdrm 和 Vulkan 开发包。发布验收使用具备 DRM 与 OpenGL 合成的 Wayland 会话，并启用 XWayland。
 
 Debian 13 试验环境的 `kwin-dev` 和 `kwin-wayland` 包版本均为 `4:6.3.6-1`，搭配 Qt 6.8.2 和 KDE Frameworks 6.13.0。
 

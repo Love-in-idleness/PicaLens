@@ -11,6 +11,8 @@ namespace KWin
 {
 class EffectWindow;
 class Output;
+class LogicalOutput;
+class Region;
 class RenderTarget;
 class RenderViewport;
 }
@@ -18,16 +20,25 @@ class RenderViewport;
 namespace PicaLens
 {
 
+#ifdef PICALENS_KWIN_67
+using Screen = KWin::LogicalOutput;
+using Damage = KWin::Region;
+#else
+using Screen = KWin::Output;
+using Damage = QRegion;
+#endif
+
 struct Presentation {
-    KWin::Output *output;
+    Screen *output;
     QRect outputRect;
     QRectF source;
     QRect destination;
 };
 
+QRect paintRect(const KWin::RenderViewport &viewport, const QRect &logicalRect);
 std::optional<Presentation> presentationFor(KWin::EffectWindow *window);
 bool paintPresentation(KWin::EffectWindow *window, const Presentation &presentation,
                        const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
-                       const QRegion &damage);
+                       const Damage &damage);
 
 }

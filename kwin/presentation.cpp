@@ -18,12 +18,21 @@
 namespace PicaLens
 {
 
+QRect paintRect([[maybe_unused]] const KWin::RenderViewport &viewport, const QRect &logicalRect)
+{
+#ifdef PICALENS_KWIN_67
+    return viewport.mapToDeviceCoordinatesAligned(KWin::Rect(logicalRect));
+#else
+    return logicalRect;
+#endif
+}
+
 std::optional<Presentation> presentationFor(KWin::EffectWindow *window)
 {
     if (!window || window->isDeleted() || !window->isVisible() || !window->screen()) {
         return std::nullopt;
     }
-    KWin::Output *output = window->screen();
+    auto *output = window->screen();
     const QRect outputRect = output->geometry();
     // On XWayland the frame extents can retain their pre-scale values after
     // an output change. Keep the full client rectangle so its pixels survive.
@@ -45,7 +54,7 @@ std::optional<Presentation> presentationFor(KWin::EffectWindow *window)
 }
 
 static void clearGlDamage(const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
-                          const QRegion &damage)
+                          const Damage &damage)
 {
     const bool hadScissor = glIsEnabled(GL_SCISSOR_TEST);
     GLint previousScissor[4];
@@ -55,8 +64,15 @@ static void clearGlDamage(const KWin::RenderTarget &target, const KWin::RenderVi
     glEnable(GL_SCISSOR_TEST);
     glClearColor(0, 0, 0, 1);
     const QRect bounds(QPoint(), target.size());
+#ifdef PICALENS_KWIN_67
+    const auto clipped = damage.intersected(target.transformedRect());
+    for (const auto &rect : clipped.rects()) {
+        const QRect buffer = viewport.transform().map(rect, target.transformedSize());
+        const QRect device = buffer.intersected(bounds);
+#else
     for (const QRect &rect : damage) {
         const QRect device = viewport.mapToRenderTarget(rect).intersected(bounds);
+#endif
         if (!device.isEmpty()) {
             glScissor(device.x(), bounds.height() - device.y() - device.height(),
                       device.width(), device.height());
@@ -72,10 +88,10 @@ static void clearGlDamage(const KWin::RenderTarget &target, const KWin::RenderVi
 
 bool paintPresentation(KWin::EffectWindow *window, const Presentation &presentation,
                        const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
-                       const QRegion &damage)
+                       const Damage &damage)
 {
-    const QRegion repaint = damage.intersected(presentation.outputRect);
-    const QRegion content = repaint.intersected(presentation.destination);
+    const auto repaint = damage.intersected(paintRect(viewport, presentation.outputRect));
+    const auto content = repaint.intersected(paintRect(viewport, presentation.destination));
     if (repaint.isEmpty() || !window || window->isDeleted()) {
         return false;
     }
@@ -113,9 +129,15 @@ bool paintPresentation(KWin::EffectWindow *window, const Presentation &presentat
         // QPainter applies the paint transform outside the WindowItem's frame translation.
         painter->save();
         painter->setCompositionMode(QPainter::CompositionMode_Source);
+#ifdef PICALENS_KWIN_67
+        for (const auto &rect : repaint.rects()) {
+            painter->fillRect(QRectF(viewport.mapFromDeviceCoordinates(rect)), Qt::black);
+        }
+#else
         for (const QRect &rect : repaint) {
             painter->fillRect(rect, Qt::black);
         }
+#endif
         painter->restore();
     }
     if (content.isEmpty()) {
@@ -132,8 +154,12 @@ bool paintPresentation(KWin::EffectWindow *window, const Presentation &presentat
                                 KWin::Effect::PAINT_WINDOW_TRANSFORMED | KWin::Effect::PAINT_WINDOW_TRANSLUCENT,
                                 content, paint);
 
+#ifdef PICALENS_KWIN_67
+    return surface->buffer() && surface->texture();
+#else
     const auto *pixmap = surface->pixmap();
     return pixmap && !pixmap->isDiscarded() && pixmap->texture()->isValid();
+#endif
 }
 
 }

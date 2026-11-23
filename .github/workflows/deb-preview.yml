@@ -2,26 +2,36 @@ name: Debian preview
 
 on:
   push:
-    tags: [v0.0.1]
+    tags: [v0.0.2]
 
 permissions:
-  contents: write
+  contents: read
 
 jobs:
-  release:
+  build:
     runs-on: ubuntu-latest
-    container: debian:trixie
+    strategy:
+      matrix:
+        include:
+          - image: debian:trixie
+            target: debian13
+            kwin_pin: "=4:6.3.6-1+deb13u1"
+          - image: ubuntu:26.10
+            target: ubuntu26.10
+            kwin_pin: "=4:6.7.5-0ubuntu1"
+    container: ${{ matrix.image }}
     env:
       DEBIAN_FRONTEND: noninteractive
       LANG: C.UTF-8
+      KWIN_PIN: ${{ matrix.kwin_pin }}
     steps:
       - name: Install Debian build dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            g++ git curl ca-certificates cmake ninja-build dpkg-dev extra-cmake-modules gh \
-            kwin-dev kwin-wayland libadwaita-1-dev libclang-dev libgtk-4-dev \
-            libpipewire-0.3-dev libwayland-dev libxkbcommon-dev pkg-config python3
+            g++ git curl ca-certificates cmake ninja-build dpkg-dev extra-cmake-modules \
+            "kwin-dev$KWIN_PIN" "kwin-wayland$KWIN_PIN" libadwaita-1-dev libclang-dev libgtk-4-dev \
+            libdrm-dev libpipewire-0.3-dev libvulkan-dev libwayland-dev libxkbcommon-dev pkg-config python3
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
@@ -35,13 +45,40 @@ jobs:
           bash packaging/build-deb.sh
           cd build/deb
           sha256sum -c SHA256SUMS
-          dpkg-deb --info picalens_0.0.1-1_amd64.deb
+          dpkg-deb --info ./*.deb
+          if dpkg-deb -f ./*.deb Depends | grep -qi kwin; then
+            exit 1
+          fi
+          dpkg -i ./*.deb
+          test -L "$(qtpaths6 --plugin-dir)/kwin/effects/plugins/picalens.so"
+          picalens --help
+      - uses: actions/upload-artifact@v4
+        with:
+          name: picalens-${{ matrix.target }}
+          path: build/deb/*.deb
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: picalens-*
+          path: artifacts
+          merge-multiple: true
       - name: Publish the preview
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          (cd artifacts && sha256sum -- *.deb > SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" \
-            build/deb/picalens_0.0.1-1_amd64.deb build/deb/SHA256SUMS \
+            artifacts/*.deb artifacts/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
-            --title "PicaLens 0.0.1 · Debian preview" \
-            --notes-file packaging/v0.0.1.md
+            --title "PicaLens ${GITHUB_REF_NAME#v} · Debian and Ubuntu preview" \
+            --notes-file "packaging/$GITHUB_REF_NAME.md"

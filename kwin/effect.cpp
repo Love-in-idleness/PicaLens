@@ -16,6 +16,7 @@
 #include "effect/effect.h"
 #include "effect/effecthandler.h"
 #include "effect/effectwindow.h"
+#include "input_event.h"
 #include "wayland_server.h"
 #include "window.h"
 
@@ -23,6 +24,11 @@ namespace KWin
 {
 
 static const QString backendPath = QStringLiteral("/io/github/LoveInIdleness/PicaLens/Backend");
+
+static void repaintOutput(const QRect &rect)
+{
+    effects->addRepaint(rect.x(), rect.y(), rect.width(), rect.height());
+}
 
 class PicaLensEffect : public Effect, protected QDBusContext
 {
@@ -108,11 +114,11 @@ public:
     }
 
     void paintScreen(const RenderTarget &target, const RenderViewport &viewport,
-                     int mask, const QRegion &damage, Output *output) override
+                     int mask, const PicaLens::Damage &damage, PicaLens::Screen *output) override
     {
         effects->paintScreen(target, viewport, mask, damage, output);
         if (!m_presentation || !m_window || output != m_presentation->output
-            || !damage.intersects(m_presentation->outputRect)) {
+            || !damage.intersects(PicaLens::paintRect(viewport, m_presentation->outputRect))) {
             return;
         }
         if (!PicaLens::paintPresentation(m_window, *m_presentation, target, viewport, damage)) {
@@ -126,7 +132,7 @@ public:
             }
             return;
         }
-        if (!m_firstPaint && !m_failedPaint && damage.intersects(m_presentation->destination)) {
+        if (!m_firstPaint && !m_failedPaint && damage.intersects(PicaLens::paintRect(viewport, m_presentation->destination))) {
             m_firstPaint = true;
             m_input.setPresentation(m_source, m_presentation->outputRect,
                                     m_presentation->destination, m_presentation->source);
@@ -134,26 +140,22 @@ public:
         }
     }
 
-    void windowInputMouseEvent(QEvent *event) override
+#ifdef PICALENS_KWIN_67
+    void pointerButton(PointerButtonEvent *event) override
     {
-        if (!m_selecting || event->type() != QEvent::MouseButtonRelease) {
-            return;
-        }
-        const auto *mouse = static_cast<QMouseEvent *>(event);
-        if (mouse->button() == Qt::RightButton) {
-            stop("selection cancelled", true);
-        } else if (mouse->button() == Qt::LeftButton && mouse->buttons() == Qt::NoButton) {
-            endSelection();
-            // KWin suppresses normal hit testing during mouse interception.
-            auto *window = input()->findToplevel(mouse->globalPosition());
-            auto *effectWindow = window ? window->effectWindow() : nullptr;
-            if (effectWindow && eligible(effectWindow)) {
-                activate(effectWindow);
-            } else {
-                stop("no eligible window selected", true);
-            }
+        if (event->state == PointerButtonState::Released) {
+            chooseWindow(event->button, event->buttons, event->position);
         }
     }
+#else
+    void windowInputMouseEvent(QEvent *event) override
+    {
+        if (event->type() == QEvent::MouseButtonRelease) {
+            const auto *mouse = static_cast<QMouseEvent *>(event);
+            chooseWindow(mouse->button(), mouse->buttons(), mouse->globalPosition());
+        }
+    }
+#endif
 
     void grabbedKeyboardEvent(QKeyEvent *event) override
     {
@@ -189,6 +191,26 @@ Q_SIGNALS:
     Q_SCRIPTABLE void Finished(const QString &reason, bool returnToControls);
 
 private:
+    void chooseWindow(Qt::MouseButton button, Qt::MouseButtons buttons, const QPointF &position)
+    {
+        if (!m_selecting) {
+            return;
+        }
+        if (button == Qt::RightButton) {
+            stop("selection cancelled", true);
+        } else if (button == Qt::LeftButton && buttons == Qt::NoButton) {
+            endSelection();
+            // KWin suppresses normal hit testing during mouse interception.
+            auto *window = input()->findToplevel(position);
+            auto *effectWindow = window ? window->effectWindow() : nullptr;
+            if (effectWindow && eligible(effectWindow)) {
+                activate(effectWindow);
+            } else {
+                stop("no eligible window selected", true);
+            }
+        }
+    }
+
     void endSelection()
     {
         if (!m_selecting) {
@@ -244,7 +266,7 @@ private:
         m_presentation = presentation;
         source->refOffscreenRendering();
         connect(window, &EffectWindow::windowDamaged, this, [this] {
-            effects->addRepaint(m_presentation->outputRect);
+            repaintOutput(m_presentation->outputRect);
         });
         connect(window, &EffectWindow::windowFrameGeometryChanged, this, [this] {
             stop("source geometry changed");
@@ -265,7 +287,7 @@ private:
             stop("source destroyed");
         });
         effects->setActiveFullScreenEffect(this);
-        effects->addRepaint(presentation->outputRect);
+        repaintOutput(presentation->outputRect);
         qInfo().nospace() << "picalens started protocol=" << (window->isX11Client() ? "xwayland" : "wayland")
                           << " source=" << presentation->source << " destination="
                           << presentation->destination << " output=" << presentation->outputRect;
@@ -307,7 +329,7 @@ private:
         if (effects->activeFullScreenEffect() == this) {
             effects->setActiveFullScreenEffect(nullptr);
         }
-        effects->addRepaint(repaint);
+        repaintOutput(repaint);
     }
 
     QPointer<EffectWindow> m_window;

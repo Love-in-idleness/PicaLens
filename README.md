@@ -2,19 +2,19 @@
 
 实时放大 Plasma 6 Wayland 会话中已打开的窗口。PicaLens 读作 *PIE-kuh lens*。
 
-## 安装 Debian 预览版
+## 安装预览版
 
-适用于 Debian 13（trixie）amd64 的 Plasma Wayland，会使用 Debian 更新后的 KWin `4:6.3.6-1+deb13u1`。下载 `.deb` 后安装，应用、桌面启动器和 KWin 后端会一起部署。 [GitHub Releases](https://github.com/Love-in-idleness/PicaLens/releases)
+从发布页选择 Ubuntu 26.10 或 Debian 13 的 amd64 安装包。以 Ubuntu 为例。 [GitHub Releases](https://github.com/Love-in-idleness/PicaLens/releases)
 
 ```sh
-sudo apt install ./picalens_0.0.1-1_amd64.deb
+sudo apt install ./picalens_0.0.2-1ubuntu26.10_amd64.deb
 ```
 
 ## 使用
 
 打开 `picalens`，点击 **Choose Window…**，选择一扇已打开的窗口。再次打开 PicaLens 或执行 `picalens toggle` 即可停止。也可以把 `picalens toggle` 设为桌面快捷键，用同一个键开始、取消选窗和停止。选窗时按 Esc 可取消。
 
-在部署了匹配后台组件的 Plasma 6 Wayland 会话中，应用会自动启用 KWin 交互模式。画面等比放大，可直接点击、滚动和使用键盘。原生 Wayland 和 XWayland 源窗使用同一入口。当前后台针对 KWin 6.3.6 构建。 [Plasma 构建与验收](docs/kwin-experiment.md)
+在 Plasma 6 Wayland 会话中，系统 KWin 与包内后台匹配时，应用会自动启用交互模式。画面等比放大，可直接点击、滚动和使用键盘。原生 Wayland 和 XWayland 源窗使用同一入口。PicaLens 的安装及 KWin 的更新可独立进行。 [Plasma 构建与验收](docs/kwin-experiment.md)
 
 缺少兼容的 KWin 后台时，应用通过桌面的 ScreenCast Portal 打开仅显示画面的全屏预览，按 Esc 退出。该模式要求 Portal 提供窗口捕获和正在运行的 PipeWire。
 
@@ -29,7 +29,7 @@ target/debug/picalens
 
 桌面启动器位于 [`data/`](data/)。本地安装时，让启动器的 `Exec=picalens` 能在会话的 `PATH` 中找到应用，再将 `.desktop` 文件放入桌面应用目录。Plasma 交互模式还需部署匹配的 KWin 后台组件。
 
-在 Debian 13 上可用 `bash packaging/build-deb.sh` 生成安装包与校验文件，输出在 `build/deb/`。构建依赖见[发布流程](.github/workflows/deb-preview.yml)。
+在 Debian 13 或 Ubuntu 26.10 上可用 `bash packaging/build-deb.sh` 生成安装包与校验文件，输出在 `build/deb/`。构建依赖见[发布流程](.github/workflows/deb-preview.yml)。
 
 ### 技术验证
 
