@@ -4,7 +4,7 @@
 
 ## 安装 Debian 预览版
 
-适用于 Debian 13（trixie）amd64 和 Debian 的 KWin `4:6.3.6-1`。下载 `.deb` 后安装，应用、桌面启动器和 KWin 后端会一起部署。 [GitHub Releases](https://github.com/Love-in-idleness/PicaLens/releases)
+适用于 Debian 13（trixie）amd64 的 Plasma Wayland，会使用 Debian 更新后的 KWin `4:6.3.6-1+deb13u1`。下载 `.deb` 后安装，应用、桌面启动器和 KWin 后端会一起部署。 [GitHub Releases](https://github.com/Love-in-idleness/PicaLens/releases)
 
 ```sh
 sudo apt install ./picalens_0.0.1-1_amd64.deb
