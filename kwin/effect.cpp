@@ -20,6 +20,13 @@
 #include "wayland_server.h"
 #include "window.h"
 
+#ifdef PICALENS_KWIN_67
+#include "core/renderviewport.h"
+#include "scene/item.h"
+#include "scene/itemrenderer.h"
+#include "scene/workspacescene.h"
+#endif
+
 namespace KWin
 {
 
@@ -113,6 +120,14 @@ public:
         return isActive();
     }
 
+#ifdef PICALENS_KWIN_67
+    void prePaintScreen(ScreenPrePaintData &data) override
+    {
+        m_paintView = data.view;
+        effects->prePaintScreen(data);
+    }
+#endif
+
     void paintScreen(const RenderTarget &target, const RenderViewport &viewport,
                      int mask, const PicaLens::Damage &damage, PicaLens::Screen *output) override
     {
@@ -132,6 +147,9 @@ public:
             }
             return;
         }
+#ifdef PICALENS_KWIN_67
+        repaintSoftwareCursor(target, viewport, damage);
+#endif
         if (!m_firstPaint && !m_failedPaint && damage.intersects(PicaLens::paintRect(viewport, m_presentation->destination))) {
             m_firstPaint = true;
             m_input.setPresentation(m_source, m_presentation->outputRect,
@@ -191,6 +209,33 @@ Q_SIGNALS:
     Q_SCRIPTABLE void Finished(const QString &reason, bool returnToControls);
 
 private:
+#ifdef PICALENS_KWIN_67
+    void repaintSoftwareCursor(const RenderTarget &target, const RenderViewport &viewport,
+                               const Region &damage)
+    {
+        auto *view = m_paintView.data();
+        auto *scene = effects->scene();
+        auto *cursor = scene->cursorItem();
+        if (!view || !cursor->isVisible() || !view->shouldRenderItem(cursor)) {
+            return;
+        }
+
+        // The scene has already painted its software cursor. Redraw only the
+        // pixels the presentation covered, with the original size and hotspot.
+        const auto bounds = viewport.mapToDeviceCoordinatesAligned(cursor->mapToScene(cursor->boundingRect()));
+        const auto repaint = damage.intersected(PicaLens::paintRect(viewport, m_presentation->outputRect))
+                                 .intersected(bounds);
+        if (!repaint.isEmpty()) {
+            scene->renderer()->renderItem(target, viewport, cursor, PAINT_SCREEN_TRANSFORMED,
+                                          repaint, WindowPaintData{}, [view](Item *item) {
+                return !view->shouldRenderItem(item);
+            }, [view](Item *item) {
+                return view->shouldRenderHole(item);
+            });
+        }
+    }
+#endif
+
     void chooseWindow(Qt::MouseButton button, Qt::MouseButtons buttons, const QPointF &position)
     {
         if (!m_selecting) {
@@ -335,6 +380,9 @@ private:
     QPointer<EffectWindow> m_window;
     QPointer<EffectWindow> m_pendingActivation;
     QPointer<Window> m_source;
+#ifdef PICALENS_KWIN_67
+    QPointer<RenderView> m_paintView;
+#endif
     QTimer m_activationTimer;
     QDBusServiceWatcher m_owner;
     std::optional<PicaLens::Presentation> m_presentation;

@@ -2,7 +2,7 @@ name: Debian preview
 
 on:
   push:
-    tags: [v0.0.2]
+    tags: [v0.0.3]
 
 permissions:
   contents: read

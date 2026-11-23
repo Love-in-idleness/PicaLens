@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.24)
-project(PicaLensKWin VERSION 0.0.2 LANGUAGES CXX)
+project(PicaLensKWin VERSION 0.0.3 LANGUAGES CXX)
 
 find_package(ECM 6.13 REQUIRED NO_MODULE)
 list(APPEND CMAKE_MODULE_PATH ${ECM_MODULE_PATH})

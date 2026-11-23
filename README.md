@@ -7,8 +7,10 @@
 从发布页选择 Ubuntu 26.10 或 Debian 13 的 amd64 安装包。以 Ubuntu 为例。 [GitHub Releases](https://github.com/Love-in-idleness/PicaLens/releases)
 
 ```sh
-sudo apt install ./picalens_0.0.2-1ubuntu26.10_amd64.deb
+sudo apt install ./picalens_0.0.3-1ubuntu26.10_amd64.deb
 ```
+
+升级后重新登录 Plasma，会话会加载新版 KWin 后台。
 
 ## 使用
 
