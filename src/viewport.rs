@@ -1,6 +1,16 @@
 use gtk::{gdk, glib, graphene, gsk, prelude::*, subclass::prelude::*};
 
-use crate::settings::{Filter, Layout};
+use crate::{
+    preview::rgba_texture,
+    session::Result,
+    settings::{Filter, Layout},
+    upscale::{self, ScaledFrame, Size},
+};
+
+struct CachedTexture {
+    source: Size,
+    texture: gdk::Texture,
+}
 
 mod imp {
     use super::*;
@@ -9,6 +19,7 @@ mod imp {
     #[derive(Default)]
     pub struct Viewport {
         pub frame: RefCell<Option<gdk::Texture>>,
+        pub(super) scaled: RefCell<Option<CachedTexture>>,
         pub layout: Cell<Layout>,
         pub filter: Cell<Filter>,
     }
@@ -46,6 +57,42 @@ impl Viewport {
         self.queue_draw();
     }
 
+    pub fn set_scaled_frame(&self, frame: ScaledFrame) -> Result<()> {
+        self.set_scaled_texture(
+            frame.source,
+            rgba_texture(frame.image.size, &frame.image.bytes)?.upcast(),
+        );
+        Ok(())
+    }
+
+    pub fn set_scaled_texture(&self, source: Size, texture: gdk::Texture) {
+        if !self
+            .imp()
+            .frame
+            .borrow()
+            .as_ref()
+            .is_some_and(|frame| size(frame) == source)
+        {
+            return;
+        }
+        self.imp()
+            .scaled
+            .replace(Some(CachedTexture { source, texture }));
+        self.queue_draw();
+    }
+
+    pub fn clear_scaled_texture(&self) {
+        self.imp().scaled.take();
+        self.queue_draw();
+    }
+
+    pub fn processing_size(&self) -> Option<Size> {
+        let frame = self.imp().frame.borrow();
+        let frame = frame.as_ref()?;
+        let scale = self.scale();
+        self.scaled_size(size(frame), self.frame_layout(frame, scale), scale)
+    }
+
     pub fn screenshot(&self) -> Option<gdk::Texture> {
         if self.imp().frame.borrow().is_none() || self.width() <= 0 || self.height() <= 0 {
             return None;
@@ -72,6 +119,23 @@ impl Viewport {
             .map_or(1.0, |surface| surface.scale())
     }
 
+    fn frame_layout(&self, frame: &gdk::Texture, scale: f64) -> [f64; 4] {
+        destination(
+            self.imp().layout.get(),
+            (f64::from(frame.width()), f64::from(frame.height())),
+            (f64::from(self.width()), f64::from(self.height())),
+            scale,
+        )
+    }
+
+    fn scaled_size(&self, source: Size, [_, _, w, h]: [f64; 4], scale: f64) -> Option<Size> {
+        upscale::processing_size(
+            self.imp().filter.get(),
+            source,
+            ((w * scale).round() as u32, (h * scale).round() as u32),
+        )
+    }
+
     fn draw(&self, snapshot: &gtk::Snapshot) {
         let width = f64::from(self.width());
         let height = f64::from(self.height());
@@ -82,21 +146,31 @@ impl Viewport {
         snapshot.append_color(&gdk::RGBA::BLACK, &clip);
         let frame = self.imp().frame.borrow();
         let Some(frame) = frame.as_ref() else { return };
-        let [x, y, w, h] = destination(
-            self.imp().layout.get(),
-            (f64::from(frame.width()), f64::from(frame.height())),
-            (width, height),
-            self.scale(),
-        );
+        let scale = self.scale();
+        let layout = self.frame_layout(frame, scale);
+        let [x, y, w, h] = layout;
         let area = graphene::Rect::new(x as f32, y as f32, w as f32, h as f32);
         let filter = match self.imp().filter.get() {
-            Filter::Linear => gsk::ScalingFilter::Linear,
-            Filter::Nearest => gsk::ScalingFilter::Nearest,
+            Filter::Linear | Filter::Lanczos | Filter::Fsr | Filter::Sgsr => {
+                gsk::ScalingFilter::Linear
+            }
+            Filter::Nearest | Filter::Scale2x => gsk::ScalingFilter::Nearest,
         };
+        let source = size(frame);
+        let target = self.scaled_size(source, layout, scale);
+        let scaled = self.imp().scaled.borrow();
+        let frame = scaled
+            .as_ref()
+            .filter(|cached| cached.source == source && target == Some(size(&cached.texture)))
+            .map_or(frame, |cached| &cached.texture);
         snapshot.push_clip(&clip);
         snapshot.append_scaled_texture(frame, filter, &area);
         snapshot.pop();
     }
+}
+
+fn size(frame: &gdk::Texture) -> Size {
+    (frame.width() as u32, frame.height() as u32)
 }
 
 fn destination(

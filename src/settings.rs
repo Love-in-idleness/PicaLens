@@ -23,9 +23,16 @@ macro_rules! choices {
 }
 
 choices!(Layout { Fit => "fit", Fill => "fill", Stretch => "stretch", Integer => "integer" });
-choices!(Filter { Linear => "linear", Nearest => "nearest" });
+choices!(Filter { Linear => "linear", Nearest => "nearest", Lanczos => "lanczos", Scale2x => "scale2x", Fsr => "fsr", Sgsr => "sgsr" });
 choices!(Presentation { Fullscreen => "fullscreen", Windowed => "windowed", Preview => "preview" });
 choices!(Language { System => "system", English => "en", Chinese => "zh-CN", Japanese => "ja" });
+choices!(Theme { System => "system", Light => "light", Dark => "dark" });
+
+impl Filter {
+    pub fn uses_gpu(self) -> bool {
+        matches!(self, Self::Fsr | Self::Sgsr)
+    }
+}
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preset {
@@ -74,6 +81,14 @@ impl Settings {
 
     pub fn set_language(&mut self, language: Language) -> Result<()> {
         self.edit(|file| file.set_string("ui", "language", language.id()))
+    }
+
+    pub fn theme(&self) -> Theme {
+        Theme::parse(&value(&self.file, "ui", "theme"))
+    }
+
+    pub fn set_theme(&mut self, theme: Theme) -> Result<()> {
+        self.edit(|file| file.set_string("ui", "theme", theme.id()))
     }
 
     pub fn selected(&self) -> String {
@@ -175,6 +190,7 @@ mod tests {
         std::fs::write(&path, "[scaling]\nlayout=stretch\n").unwrap();
         let mut settings = Settings::open(&path);
         assert_eq!(settings.preset(DEFAULT_ID).layout, Layout::Stretch);
+        assert_eq!(settings.theme(), Theme::System);
         let preset = Preset {
             name: "村正".into(),
             layout: Layout::Integer,
@@ -183,9 +199,11 @@ mod tests {
         settings.save_preset("mine", &preset).unwrap();
         settings.select("mine").unwrap();
         settings.set_language(Language::Japanese).unwrap();
+        settings.set_theme(Theme::Dark).unwrap();
         let mut settings = Settings::open(&path);
         assert_eq!(settings.preset(&settings.selected()), preset);
         assert_eq!(settings.language(), Language::Japanese);
+        assert_eq!(settings.theme(), Theme::Dark);
         settings.delete("preset", "mine").unwrap();
         assert_eq!(settings.selected(), DEFAULT_ID);
         std::fs::remove_dir_all(dir).unwrap();

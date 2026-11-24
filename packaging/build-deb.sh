@@ -57,6 +57,7 @@ ln -s ../applications/io.github.LoveInIdleness.PicaLens.desktop \
     "$stage/usr/share/kglobalaccel/io.github.LoveInIdleness.PicaLens.desktop"
 docs=$stage/usr/share/doc/picalens
 install -Dm644 packaging/copyright "$docs/copyright"
+install -Dm644 src/shaders/LICENSES "$docs/shader-licenses.txt"
 host=$(rustc --print host-tuple)
 cargo metadata --locked --format-version 1 --filter-platform "$host" \
     | python3 packaging/rust-notices.py | gzip -n > "$docs/rust-dependencies.txt.gz"
@@ -78,7 +79,7 @@ Priority: optional
 Maintainer: PicaLens <93856868+Love-in-idleness@users.noreply.github.com>
 Installed-Size: $(du -sk "$stage/usr" | cut -f1)
 Depends: $depends
-Recommends: pipewire, wireplumber, xdg-desktop-portal
+Recommends: pipewire, wireplumber, xdg-desktop-portal, libegl1
 Suggests: kwin-wayland, xdg-desktop-portal-kde, gnome-shell, gamescope
 Homepage: https://github.com/Love-in-idleness/PicaLens
 Description: Magnify Wayland windows and launch games with Gamescope

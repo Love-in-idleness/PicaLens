@@ -10,6 +10,7 @@ mod capture;
 mod game_page;
 mod gamescope;
 mod gnome;
+mod gpu;
 mod input;
 mod kwin;
 mod locale;
@@ -19,6 +20,7 @@ mod session;
 mod settings;
 mod shortcut;
 mod standalone;
+mod upscale;
 mod viewport;
 
 pub use probe::run as run_probe;

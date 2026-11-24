@@ -343,23 +343,27 @@ impl Preview {
 }
 
 pub fn frame_texture(frame: Frame) -> crate::session::Result<gdk::MemoryTexture> {
-    let width = i32::try_from(frame.width)?;
-    let height = i32::try_from(frame.height)?;
-    let stride = usize::try_from(frame.width)?
+    rgba_texture(
+        (frame.width, frame.height),
+        &glib::Bytes::from_owned(frame.rgba),
+    )
+}
+
+pub fn rgba_texture(
+    (width, height): (u32, u32),
+    bytes: &glib::Bytes,
+) -> crate::session::Result<gdk::MemoryTexture> {
+    let stride = usize::try_from(width)?
         .checked_mul(4)
         .ok_or("stride overflow")?;
-    if width == 0
-        || height == 0
-        || stride.checked_mul(frame.height as usize) != Some(frame.rgba.len())
-    {
+    if width == 0 || height == 0 || stride.checked_mul(height as usize) != Some(bytes.len()) {
         return Err("invalid RGBA preview frame".into());
     }
-    let bytes = glib::Bytes::from_owned(frame.rgba);
     Ok(gdk::MemoryTexture::new(
-        width,
-        height,
+        i32::try_from(width)?,
+        i32::try_from(height)?,
         gdk::MemoryFormat::R8g8b8a8,
-        &bytes,
+        bytes,
         stride,
     ))
 }

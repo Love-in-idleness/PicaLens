@@ -2,7 +2,7 @@ name: Debian preview
 
 on:
   push:
-    tags: [v0.0.3]
+    tags: [v0.1.0]
 
 permissions:
   contents: read
@@ -80,5 +80,5 @@ jobs:
           gh release create "$GITHUB_REF_NAME" \
             artifacts/*.deb artifacts/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
-            --title "PicaLens ${GITHUB_REF_NAME#v} · Debian and Ubuntu preview" \
+            --title "PicaLens ${GITHUB_REF_NAME#v} · Wayland preview" \
             --notes-file "packaging/$GITHUB_REF_NAME.md"

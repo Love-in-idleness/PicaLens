@@ -1,6 +1,6 @@
 [package]
 name = "picalens"
-version = "0.0.7"
+version = "0.1.0"
 edition = "2024"
 default-run = "picalens"
 rust-version = "1.89"
@@ -8,9 +8,12 @@ rust-version = "1.89"
 [dependencies]
 adw = { package = "libadwaita", version = "0.8", features = ["v1_4"] }
 ashpd = { version = "0.12", default-features = false, features = ["async-std", "gtk4_wayland"] }
-gtk = { package = "gtk4", version = "0.10", features = ["v4_12"] }
+fast_image_resize = { version = "5.5", features = ["only_u8x4"] }
+glow = "0.16"
+gtk = { package = "gtk4", version = "0.10", features = ["v4_14"] }
 futures-channel = "0.3"
 futures-util = "0.3"
 libc = "0.2"
+libloading = "0.8"
 pipewire = "0.9"
 reis = "0.7.1"

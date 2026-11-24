@@ -25,6 +25,15 @@ pub enum Target {
     Choose,
 }
 
+pub fn portal_desktop() -> bool {
+    std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .any(|desktop| {
+            desktop.eq_ignore_ascii_case("niri") || desktop.eq_ignore_ascii_case("Hyprland")
+        })
+}
+
 pub async fn diagnostics() -> Result<()> {
     for key in ["XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "WAYLAND_DISPLAY"] {
         println!("{key}={}", std::env::var(key).unwrap_or_default());
@@ -101,16 +110,21 @@ pub async fn run(view: &Preview, experiment: bool, stop: Stop) -> Result<&'stati
 }
 
 async fn window_portal() -> Result<Screencast<'static>> {
-    let cast = Screencast::new().await?;
-    if !cast
-        .available_source_types()
-        .await?
-        .contains(SourceType::Window)
-    {
-        return Err("ScreenCast does not advertise window sources".into());
+    let cast = Screencast::new().await.map_err(|error| {
+        diagnostic!("ScreenCast portal unavailable: {error}");
+        "window_portal_unavailable"
+    })?;
+    match cast.available_source_types().await {
+        Ok(types) if types.contains(SourceType::Window) => Ok(cast),
+        Ok(types) => {
+            diagnostic!("ScreenCast does not advertise window sources: {types:?}");
+            Err("window_portal_unavailable".into())
+        }
+        Err(error) => {
+            diagnostic!("ScreenCast.AvailableSourceTypes: {error}");
+            Err("window_portal_unavailable".into())
+        }
     }
-
-    Ok(cast)
 }
 
 pub async fn capture_window(

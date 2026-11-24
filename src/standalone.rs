@@ -12,12 +12,15 @@ use gtk::{gdk, gio, glib};
 use crate::{
     capture::Capture,
     game_page::GamePage,
-    gnome, kwin,
+    gnome,
+    gpu::GpuUpscaler,
+    kwin,
     locale::Locale,
     preview::{self, StopSender},
     session::{self, Result, Stop, Target},
-    settings::{DEFAULT_ID, Filter, Language, Layout, Presentation, Preset, Settings},
+    settings::{DEFAULT_ID, Filter, Language, Layout, Presentation, Preset, Settings, Theme},
     shortcut::{self, DesktopShortcut},
+    upscale::{Pixels, Upscaler},
     viewport::Viewport,
 };
 
@@ -62,7 +65,12 @@ pub fn run() -> std::process::ExitCode {
                 view.window.present();
             }
         } else if !view.stop("toggle") {
-            view.start(app, Target::Active);
+            let target = if session::portal_desktop() {
+                Target::Choose
+            } else {
+                Target::Active
+            };
+            view.start(app, target);
         }
         glib::ExitCode::SUCCESS
     });
@@ -96,6 +104,9 @@ impl View {
     fn new(app: &adw::Application) -> Rc<Self> {
         let settings = Rc::new(RefCell::new(Settings::load()));
         let locale = Locale::new(settings.borrow().language());
+        let style = app.style_manager();
+        let current_theme = settings.borrow().theme();
+        apply_theme(&style, current_theme);
         let t = |key| locale.text(key);
         let window = adw::ApplicationWindow::builder()
             .application(app)
@@ -202,6 +213,13 @@ impl View {
         let ui = adw::PreferencesGroup::builder()
             .title(t("appearance"))
             .build();
+        let theme = combo(
+            locale,
+            "theme",
+            Theme::ALL.iter().map(|item| item.id()),
+            index(Theme::ALL, current_theme),
+        );
+        ui.add(&theme);
         let language = combo(
             locale,
             "language",
@@ -319,6 +337,28 @@ impl View {
                     match result {
                         Ok(()) => view.toast("language_restart"),
                         Err(error) => view.save_failed(error),
+                    }
+                }
+            }
+        });
+        theme.connect_selected_notify({
+            let weak = Rc::downgrade(&view);
+            move |row| {
+                let (Some(view), Some(&theme)) =
+                    (weak.upgrade(), Theme::ALL.get(row.selected() as usize))
+                else {
+                    return;
+                };
+                let saved = view.settings.borrow().theme();
+                if theme == saved {
+                    return;
+                }
+                let result = view.settings.borrow_mut().set_theme(theme);
+                match result {
+                    Ok(()) => apply_theme(&style, theme),
+                    Err(error) => {
+                        row.set_selected(index(Theme::ALL, saved) as u32);
+                        view.save_failed(error);
                     }
                 }
             }
@@ -627,7 +667,7 @@ impl View {
         preset: &Preset,
         target: Target,
     ) -> Result<String> {
-        let needs_portal = portal_required(preset);
+        let needs_portal = portal_required(preset) || session::portal_desktop();
         if needs_portal && target == Target::Active {
             return Err("active_window_preset".into());
         }
@@ -688,28 +728,65 @@ impl View {
     ) -> Result<&'static str> {
         let started = Instant::now();
         let viewport = Viewport::new(preset.layout, preset.filter);
+        let mut upscaler = Upscaler::new(preset.filter)?;
+        let mut gpu = preset
+            .filter
+            .uses_gpu()
+            .then(|| GpuUpscaler::new(preset.filter));
         viewport.update_property(&[gtk::accessible::Property::Label(&self.t("preview_image"))]);
-        let mut opened = false;
+        let mut toasts = None;
         loop {
             if let Some(error) = capture.take_error() {
                 return Err(error.into());
             }
             if let Some(frame) = capture.take_frame() {
-                viewport.set_frame(preview::frame_texture(frame)?.upcast());
-                if !opened {
-                    self.open_preview(&viewport, preset.presentation != Presentation::Windowed)?;
-                    opened = true;
+                let pixels = Pixels::from(frame);
+                viewport.set_frame(preview::rgba_texture(pixels.size, &pixels.bytes)?.upcast());
+                if let Some(upscaler) = &mut upscaler {
+                    upscaler.set_source(pixels);
+                } else if let Some(gpu) = &mut gpu {
+                    gpu.set_source(pixels);
+                }
+                if toasts.is_none() {
+                    toasts =
+                        Some(self.open_preview(
+                            &viewport,
+                            preset.presentation != Presentation::Windowed,
+                        )?);
                     diagnostic!("picalens portal first frame drawn");
                 }
             }
-            if !opened && started.elapsed() > Duration::from_secs(15) {
+            if let Some(upscaler) = &mut upscaler
+                && let Some(frame) = upscaler.update(viewport.processing_size())?
+            {
+                viewport.set_scaled_frame(frame)?;
+            }
+            if let Some(upscaler) = &mut gpu {
+                match upscaler.update(&viewport.display(), viewport.processing_size()) {
+                    Ok(Some((source, texture))) => viewport.set_scaled_texture(source, texture),
+                    Ok(None) => {}
+                    Err(error) => {
+                        diagnostic!("picalens preview GPU filter unavailable: {error}");
+                        gpu = None;
+                        viewport.clear_scaled_texture();
+                        if let Some(toasts) = &toasts {
+                            toasts.add_toast(adw::Toast::new(&self.t("gpu_filter_fallback")));
+                        }
+                    }
+                }
+            }
+            if toasts.is_none() && started.elapsed() > Duration::from_secs(15) {
                 return Err("no_frame".into());
             }
             glib::timeout_future(Duration::from_millis(16)).await;
         }
     }
 
-    fn open_preview(self: &Rc<Self>, viewport: &Viewport, fullscreen: bool) -> Result<()> {
+    fn open_preview(
+        self: &Rc<Self>,
+        viewport: &Viewport,
+        fullscreen: bool,
+    ) -> Result<adw::ToastOverlay> {
         let app = self.window.application().ok_or("application shutdown")?;
         let window = adw::ApplicationWindow::builder()
             .application(&app)
@@ -819,7 +896,7 @@ impl View {
         }
         window.present();
         self.capture_window.replace(Some(window));
-        Ok(())
+        Ok(toasts)
     }
 
     fn capture_screenshot(
@@ -873,6 +950,7 @@ impl View {
                 let error = error.to_string();
                 let key = match error.as_str() {
                     "no_frame"
+                    | "window_portal_unavailable"
                     | "kwin_upgrade"
                     | "gnome_unavailable"
                     | "gnome_no_windows"
@@ -901,7 +979,7 @@ impl View {
 fn portal_required(preset: &Preset) -> bool {
     preset.presentation != Presentation::Fullscreen
         || preset.layout == Layout::Integer
-        || preset.filter == Filter::Nearest
+        || preset.filter != Filter::Linear
 }
 
 fn is_gnome() -> bool {
@@ -925,6 +1003,14 @@ fn is_plasma() -> bool {
 fn set_tools_visible(tools: &gtk::Box, visible: bool) {
     tools.set_opacity(if visible { 1.0 } else { 0.0 });
     tools.set_can_target(visible);
+}
+
+fn apply_theme(style: &adw::StyleManager, theme: Theme) {
+    style.set_color_scheme(match theme {
+        Theme::System => adw::ColorScheme::Default,
+        Theme::Light => adw::ColorScheme::ForceLight,
+        Theme::Dark => adw::ColorScheme::ForceDark,
+    });
 }
 
 fn index<T: PartialEq>(items: &[T], item: T) -> usize {

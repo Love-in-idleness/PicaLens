@@ -7,3 +7,6 @@ version 2 license is available in /usr/share/common-licenses/GPL-2.
 
 Licenses and attribution notices for bundled Rust dependencies are supplied
 in rust-dependencies.txt.gz in this directory.
+
+Notices for the bundled AMD FidelityFX FSR 1 and Qualcomm SGSR shader code
+are supplied in shader-licenses.txt in this directory.
