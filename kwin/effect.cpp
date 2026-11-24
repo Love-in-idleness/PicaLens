@@ -4,6 +4,7 @@
 #include "presentation.h"
 
 #include <QDBusConnection>
+#include <QDBusConnectionInterface>
 #include <QDBusContext>
 #include <QDBusMessage>
 #include <QDBusServiceWatcher>
@@ -13,10 +14,13 @@
 #include <QPointer>
 #include <QTimer>
 
+#include "cursor.h"
+#include "cursorsource.h"
 #include "effect/effect.h"
 #include "effect/effecthandler.h"
 #include "effect/effectwindow.h"
 #include "input_event.h"
+#include "pointer_input.h"
 #include "wayland_server.h"
 #include "window.h"
 
@@ -99,6 +103,10 @@ public:
                 stop("another fullscreen effect took over");
             }
         });
+        auto *mouse = Cursors::self()->mouse();
+        connect(mouse, &Cursor::cursorChanged, this, &PicaLensEffect::updateCursor);
+        connect(mouse, &Cursor::posChanged, this, &PicaLensEffect::updateCursor);
+        m_fallbackCursor.setShape(Qt::ArrowCursor);
         qInfo("picalens loaded");
     }
 
@@ -185,17 +193,36 @@ public:
 public Q_SLOTS:
     Q_SCRIPTABLE bool Start()
     {
-        if (!calledFromDBus() || !m_owner.watchedServices().isEmpty()
-            || effects->isScreenLocked() || effects->activeFullScreenEffect()
-            || effects->isMouseInterception() || input()->isSelectingWindow()
-            || !effects->grabKeyboard(this)) {
+        return startSelection(PicaLens::Layout::Fit);
+    }
+
+    Q_SCRIPTABLE QStringList SupportedLayouts() const
+    {
+        return {QStringLiteral("fit"), QStringLiteral("stretch"), QStringLiteral("fill")};
+    }
+
+    Q_SCRIPTABLE bool StartWithLayout(const QString &layout)
+    {
+        const auto parsed = parseLayout(layout);
+        return parsed && startSelection(*parsed);
+    }
+
+    Q_SCRIPTABLE bool StartActive(const QString &layout)
+    {
+        const auto parsed = parseLayout(layout);
+        if (!parsed || !canStart()) {
+            return false;
+        }
+        const auto appId = QStringLiteral("io.github.LoveInIdleness.PicaLens");
+        const auto owner = connection().interface()->serviceOwner(appId);
+        auto *window = effects->activeWindow();
+        if (!owner.isValid() || owner.value() != message().service() || !window || !eligible(window)
+            || window->window()->desktopFileName() == appId || window->window()->resourceClass() == appId) {
             return false;
         }
         m_owner.addWatchedService(message().service());
-        m_selecting = true;
-        effects->startMouseInterception(this, Qt::CrossCursor);
-        qInfo("picalens selecting an existing window");
-        return true;
+        m_layout = *parsed;
+        return start(window);
     }
 
     Q_SCRIPTABLE void Stop()
@@ -209,6 +236,71 @@ Q_SIGNALS:
     Q_SCRIPTABLE void Finished(const QString &reason, bool returnToControls);
 
 private:
+    static std::optional<PicaLens::Layout> parseLayout(const QString &layout)
+    {
+        if (layout == QStringLiteral("stretch")) {
+            return PicaLens::Layout::Stretch;
+        }
+        if (layout == QStringLiteral("fill")) {
+            return PicaLens::Layout::Fill;
+        }
+        if (layout == QStringLiteral("fit")) {
+            return PicaLens::Layout::Fit;
+        }
+        return std::nullopt;
+    }
+
+    bool canStart() const
+    {
+        return calledFromDBus() && m_owner.watchedServices().isEmpty()
+            && !effects->isScreenLocked() && !effects->activeFullScreenEffect()
+            && !effects->isMouseInterception() && !input()->isSelectingWindow();
+    }
+
+    bool startSelection(PicaLens::Layout layout)
+    {
+        if (!canStart() || !effects->grabKeyboard(this)) {
+            return false;
+        }
+        m_owner.addWatchedService(message().service());
+        m_layout = layout;
+        m_selecting = true;
+        effects->startMouseInterception(this, Qt::CrossCursor);
+        qInfo("picalens selecting an existing window");
+        return true;
+    }
+
+    void updateCursor()
+    {
+        auto *mouse = Cursors::self()->mouse();
+        auto *source = mouse->source();
+        const bool showingFallback = source == &m_fallbackCursor;
+        if (showingFallback) {
+            source = m_originalCursor.data();
+        }
+        const bool useFallback = m_presentation && QRectF(m_presentation->outputRect).contains(mouse->pos())
+            && (!source || source->isBlank()) && !m_fallbackCursor.isBlank();
+        if (showingFallback && useFallback) {
+            return;
+        }
+
+        if (m_originalCursorChanged) {
+            disconnect(m_originalCursorChanged);
+            m_originalCursorChanged = {};
+        }
+        m_originalCursor.clear();
+        if (useFallback) {
+            // Keep watching the client cursor while KWin displays the arrow.
+            m_originalCursor = source;
+            if (source) {
+                m_originalCursorChanged = connect(source, &CursorSource::changed, this, &PicaLensEffect::updateCursor);
+            }
+            mouse->setSource(&m_fallbackCursor);
+        } else if (showingFallback) {
+            mouse->setSource(source);
+        }
+    }
+
 #ifdef PICALENS_KWIN_67
     void repaintSoftwareCursor(const RenderTarget &target, const RenderViewport &viewport,
                                const Region &damage)
@@ -291,23 +383,24 @@ private:
         });
     }
 
-    void start(EffectWindow *window)
+    bool start(EffectWindow *window)
     {
         m_pendingActivation.clear();
         m_activationTimer.stop();
         if (!eligible(window)) {
             stop("selected window is no longer eligible");
-            return;
+            return false;
         }
         auto *source = window->window();
-        auto presentation = PicaLens::presentationFor(window);
+        auto presentation = PicaLens::presentationFor(window, m_layout);
         if (!source->surface() || !presentation) {
             stop("window has no usable presentation");
-            return;
+            return false;
         }
 
         m_window = window;
         m_source = source;
+        m_fallbackCursor.setTheme(input()->pointer()->cursorTheme());
         m_presentation = presentation;
         source->refOffscreenRendering();
         connect(window, &EffectWindow::windowDamaged, this, [this] {
@@ -332,10 +425,12 @@ private:
             stop("source destroyed");
         });
         effects->setActiveFullScreenEffect(this);
+        updateCursor();
         repaintOutput(presentation->outputRect);
         qInfo().nospace() << "picalens started protocol=" << (window->isX11Client() ? "xwayland" : "wayland")
                           << " source=" << presentation->source << " destination="
                           << presentation->destination << " output=" << presentation->outputRect;
+        return true;
     }
 
     void stop(const char *reason, bool returnToControls = false)
@@ -362,6 +457,7 @@ private:
         m_firstPaint = false;
         m_failedPaint = false;
         m_input.clear();
+        updateCursor();
         if (m_window) {
             disconnect(m_window, nullptr, this, nullptr);
             m_window.clear();
@@ -385,8 +481,12 @@ private:
 #endif
     QTimer m_activationTimer;
     QDBusServiceWatcher m_owner;
+    ShapeCursorSource m_fallbackCursor;
+    QPointer<CursorSource> m_originalCursor;
+    QMetaObject::Connection m_originalCursorChanged;
     std::optional<PicaLens::Presentation> m_presentation;
     PicaLensInputFilter m_input;
+    PicaLens::Layout m_layout = PicaLens::Layout::Fit;
     bool m_registered = false;
     bool m_selecting = false;
     bool m_firstPaint = false;

@@ -123,3 +123,31 @@ cargo build --locked
 在 Plasma 6 Wayland 会话中，从 `picalens` 或 `picalens toggle` 进入合成器交互模式。KWin 负责选窗、等比绘制和输入映射。原生 Wayland 与 XWayland 均已在嵌套 KWin 6.3.6 的 QPainter 后端通过 100% 和 150% 缩放的输入对照。DRM/OpenGL 后端与 Portal 窗口流分别验收。 [Plasma 构建与验收](kwin-experiment.md)
 
 Mutter 50.1 对窗口流的 EIS 绝对坐标做表面到舞台的坐标变换，然后向 Clutter 虚拟设备发送移动和按键。GNOME 50.1 实机类型绑定检查确认 Shell 可获取窗口演员、查询位置下的演员，并反算演员坐标。`Meta.WaylandPointer` 未从该版本的 GObject Introspection 暴露，设置 Wayland 指针焦点的函数位于 Mutter 内部。当前源码审查及实测尚未确认 Shell 扩展能将点击投给被覆盖的源面，不能据此开启该路径。 [窗口流坐标变换](https://github.com/GNOME/mutter/blob/50.1/src/backends/meta-screen-cast-window-stream.c#L321) · [EIS 事件提交](https://github.com/GNOME/mutter/blob/50.1/src/backends/meta-eis-client.c#L503) · [Wayland 指针焦点](https://github.com/GNOME/mutter/blob/50.1/src/wayland/meta-wayland-pointer.c#L1096)
+
+## 0.0.4 菜单与缩放验收
+
+- GNOME 51 实机，1920×1200、150% 缩放。桌面启动器的 Toggle 动作打开系统选窗，《村正》窗口流的裁剪区域为 1545×912，使用线性 DMA-BUF。新版全屏预览映射为 1280×800 逻辑像素，持续出帧后按 Esc 回到菜单。
+- 隔离的 GNOME 51 会话，1920×1200、150% 缩放。用与《村正》窗口流等尺寸的四色角标测试纹理验证截图。等比适应截图保留四角和上下黑边，裁剪铺满截图按预期裁剪两侧。两张 PNG 均为 1920×1200。
+- GNOME 51 的组合会话分别出现过仅授予键盘与指针、仅授予带 `mapping_id` 的窗口流两种结果。前者无法映射到目标窗口，后者无法启用探针的单次输入。100% 隔离会话和 150% 实机均未通过组合验收，已打开窗口继续使用只读预览。
+- 隔离的 KWin 6.7.5 会话，1280×800。新后端公布 `fit`、`stretch`、`fill`，裁剪铺满把 800×500 源矩形映射到全屏。测试源窗记录了中心第 5 个按钮命中和 A 键按下及释放。
+- Gamescope 3.16.24 通过 PicaLens 界面从带中文和空格的路径启动 Wine 测试程序。游戏窗口实际映射，接收鼠标点击和键盘输入。首发三语目录通过一致性检查，中文和日文界面完成运行检查，三个语言设置分别通过已安装二进制的 CLI 文案检查。
+
+## 0.0.5 GNOME 原窗口交互
+
+GNOME Shell 51.0 和 Mutter 51.0 的隔离会话使用 1920×1200 输出。PicaLens 选择原生 Wayland 测试窗，Shell 直接变换原窗口的演员，Mutter 负责鼠标命中。100% 和 150% 缩放均通过九点点击和滚轮检查，等比模式的黑边点击没有送给源窗。Esc 恢复原窗，快捷键命令 `picalens toggle` 可取消选窗和结束放大。扩展禁用后，同一个客户端回退到 Portal 选窗。其他 D-Bus 连接请求开始放大收到 `AccessDenied`。
+
+在 150% 会话中，使用独立游戏副本和 Wine 前缀启动 `Muramasa_chs.exe`。隔离的 PipeWire 空音频输出满足游戏的 DirectSound 初始化。受测游戏通过 Wine Wayland 出窗后，在交互全屏中用鼠标打开「设定画面」并回到标题。随后强制结束测试客户端，扩展收到客户端断开事件并恢复窗口和 Shell 顶栏，游戏进程继续运行。
+
+Ubuntu 27.04 的 `.deb` 包含 GNOME 扩展。首次安装到用户目录时，Shell 在重新登录时扫描并加载新扩展。已在隔离会话验收加载后的行为，当前桌面会话保留到用户自行重新登录。
+
+## 0.0.6 GNOME XWayland 原窗口交互
+
+- 在隔离的 GNOME Shell 51.0 会话使用 Ubuntu Mutter `51.0-1ubuntu3` 和 1920×1200 输出。仅放开扩展的 XWayland 选窗限制时，边缘点击丢失。补丁为放大中的窗口反算坐标，再沿用 Mutter 原有的 XWayland 缓冲区坐标换算。未加载补丁的 Shell 仍只在交互选窗中列出原生 Wayland 窗口。 [Mutter 51 XWayland 坐标实现](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/wayland/meta-xwayland-surface.c)
+- 100% 和 150% 缩放下，XWayland 测试窗均按顺序命中 1–9，接收滚轮和普通按键。黑边点击未送到源窗，Esc 结束放大。所打包的库在版本匹配时由测试 Shell 加载，模拟版本不符时启动器使用系统库。
+- 同一补丁会话同时列出原生 Wayland 和 XWayland 测试窗。选中原生 Wayland 测试窗后通过中心点击、滚轮和 Esc 恢复检查。
+- 在 150% 缩放下，用独立游戏副本和前缀启动 `Muramasa_chs.exe`。Wine 日志确认游戏加载了 `winex11.drv`，游戏同时出现在 XWayland 根窗口树和交互选窗中。放大后使用鼠标进入「设定画面」并返回标题。按 Esc 结束放大后返回 PicaLens，游戏进程仍在运行。
+
+## 0.0.7 快捷键直接放大活动窗口
+
+- 在隔离的 GNOME 51 和 KWin 6.7.5 会话通过桌面绑定发送 Ctrl+Super+Z。原生 Wayland 与 XWayland 测试窗都能直接放大，命中中心按钮，再按同一组合键恢复。
+- GNOME 中用界面的「选择窗口」打开选择器并放大源窗。PicaLens 自己获得焦点时，快捷键提示没有支持的活动窗口。GNOME 和 KWin 均拒绝未持有 PicaLens 应用名称的 D-Bus 连接发起直接放大。

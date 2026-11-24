@@ -7,12 +7,19 @@ macro_rules! diagnostic {
 }
 
 mod capture;
+mod game_page;
+mod gamescope;
+mod gnome;
 mod input;
 mod kwin;
+mod locale;
 mod preview;
 mod probe;
 mod session;
+mod settings;
+mod shortcut;
 mod standalone;
+mod viewport;
 
 pub use probe::run as run_probe;
 pub use standalone::run;

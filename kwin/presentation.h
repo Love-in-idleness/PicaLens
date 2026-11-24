@@ -35,8 +35,10 @@ struct Presentation {
     QRect destination;
 };
 
+enum class Layout { Fit, Stretch, Fill };
+
 QRect paintRect(const KWin::RenderViewport &viewport, const QRect &logicalRect);
-std::optional<Presentation> presentationFor(KWin::EffectWindow *window);
+std::optional<Presentation> presentationFor(KWin::EffectWindow *window, Layout layout);
 bool paintPresentation(KWin::EffectWindow *window, const Presentation &presentation,
                        const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
                        const Damage &damage);

@@ -1,0 +1,7 @@
+{
+  "uuid": "picalens@love-in-idleness.github.io",
+  "name": "PicaLens",
+  "description": "Interactive magnification of an open Wayland window from PicaLens",
+  "shell-version": ["51"],
+  "url": "https://github.com/Love-in-idleness/PicaLens"
+}

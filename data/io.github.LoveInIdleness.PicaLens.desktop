@@ -2,10 +2,21 @@
 Type=Application
 Name=PicaLens
 Name[zh_CN]=PicaLens（鹊镜）
-Comment=Magnify an open window
-Comment[zh_CN]=放大已打开的窗口
+Name[ja]=PicaLens
+Comment=Magnify windows and launch games with Gamescope
+Comment[zh_CN]=放大窗口并通过 Gamescope 启动游戏
+Comment[ja]=ウィンドウを拡大し、Gamescope でゲームを起動
 Exec=picalens
 TryExec=picalens
 Icon=zoom-in
 Terminal=false
+StartupNotify=false
 Categories=Utility;Accessibility;
+Actions=Toggle;
+
+[Desktop Action Toggle]
+Name=Toggle Magnification
+Name[zh_CN]=切换窗口放大
+Name[ja]=ウィンドウの拡大を切り替え
+Exec=picalens toggle
+X-KDE-Shortcuts=Meta+Ctrl+Z

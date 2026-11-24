@@ -19,7 +19,7 @@ pub type StopSender = Rc<RefCell<Option<oneshot::Sender<&'static str>>>>;
 
 pub fn install_style(display: &gdk::Display) {
     let css = gtk::CssProvider::new();
-    css.load_from_data(".capture-view { background: black; }");
+    css.load_from_string(".capture-view { background: black; }");
     gtk::style_context_add_provider_for_display(
         display,
         &css,

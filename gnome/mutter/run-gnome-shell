@@ -1,0 +1,11 @@
+#!/bin/sh
+set -eu
+
+component=${0%/*}
+# A system upgrade must start the distro Shell if the private library no
+# longer matches its installed Mutter and its other private libraries.
+if [ -r "$component/libmutter-51.so.0" ] &&
+   [ "$(dpkg-query -W -f='${db:Status-Abbrev} ${Version}' "libmutter-51-0:$(dpkg --print-architecture)" 2>/dev/null)" = "ii  ${component##*/}" ]; then
+    export LD_LIBRARY_PATH="$component${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
+fi
+exec /usr/bin/gnome-shell "$@"

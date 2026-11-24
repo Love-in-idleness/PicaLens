@@ -27,7 +27,7 @@ QRect paintRect([[maybe_unused]] const KWin::RenderViewport &viewport, const QRe
 #endif
 }
 
-std::optional<Presentation> presentationFor(KWin::EffectWindow *window)
+std::optional<Presentation> presentationFor(KWin::EffectWindow *window, Layout layout)
 {
     if (!window || window->isDeleted() || !window->isVisible() || !window->screen()) {
         return std::nullopt;
@@ -36,14 +36,23 @@ std::optional<Presentation> presentationFor(KWin::EffectWindow *window)
     const QRect outputRect = output->geometry();
     // On XWayland the frame extents can retain their pre-scale values after
     // an output change. Keep the full client rectangle so its pixels survive.
-    const QRectF source = window->clientGeometry();
+    QRectF source = window->clientGeometry();
     if (source.isEmpty() || outputRect.isEmpty() || !window->bufferGeometry().contains(source)) {
         return std::nullopt;
     }
 
-    QSizeF fit = source.size();
-    fit.scale(outputRect.size(), Qt::KeepAspectRatio);
-    const QSize size = fit.toSize();
+    QSize size = outputRect.size();
+    if (layout == Layout::Fit) {
+        QSizeF fit = source.size();
+        fit.scale(size, Qt::KeepAspectRatio);
+        size = fit.toSize();
+    } else if (layout == Layout::Fill) {
+        QSizeF visible(size);
+        visible.scale(source.size(), Qt::KeepAspectRatio);
+        const QPointF center = source.center();
+        source.setSize(visible);
+        source.moveCenter(center);
+    }
     if (size.isEmpty()) {
         return std::nullopt;
     }

@@ -1,4 +1,5 @@
 use std::{
+    cell::{Cell, RefCell},
     io::{self, Cursor},
     mem::size_of,
     os::fd::OwnedFd,
@@ -26,6 +27,7 @@ use spa::{
 
 const MAX_DIMENSION: u32 = 4096;
 const CHUNK_FLAG_EMPTY: i32 = 1 << 1; // Not exported by older SPA headers.
+const DRM_FORMAT_MOD_LINEAR: u64 = 0;
 
 pub struct Frame {
     pub width: u32,
@@ -118,7 +120,7 @@ fn run(
     let context = pw::context::ContextRc::new(&mainloop, None)?;
     let core = context.connect_fd_rc(fd, None)?;
 
-    let failure = Rc::new(std::cell::RefCell::new(None));
+    let failure = Rc::new(RefCell::new(None));
     let fail = {
         let mainloop = mainloop.clone();
         let failure = Rc::clone(&failure);
@@ -152,8 +154,32 @@ fn run(
         })
         .register();
 
+    // Mutter can render MemFd window frames at a different scale from VideoCrop.
+    // Its DMA-BUF path renders directly at the scale of the advertised crop.
+    let gnome = std::env::var("XDG_CURRENT_DESKTOP")
+        .unwrap_or_default()
+        .split(':')
+        .any(|name| name.eq_ignore_ascii_case("gnome"));
+    let retry = run_stream(&core, &mainloop, &fail, &failure, node_id, mailbox, gnome)?;
+    if retry && failure.borrow().is_none() {
+        run_stream(&core, &mainloop, &fail, &failure, node_id, mailbox, false)?;
+    }
+    let result = failure.borrow_mut().take();
+    result.map_or(Ok(()), |message| Err(message.into()))
+}
+
+fn run_stream(
+    core: &pw::core::Core,
+    mainloop: &pw::main_loop::MainLoopRc,
+    fail: &Rc<impl Fn(String) + 'static>,
+    failure: &RefCell<Option<String>>,
+    node_id: u32,
+    mailbox: &Arc<Mutex<Mailbox>>,
+    prefer_linear: bool,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let retry = Rc::new(Cell::new(false));
     let stream = pw::stream::StreamBox::new(
-        &core,
+        core,
         "picalens-probe",
         properties! {
             *pw::keys::MEDIA_TYPE => "Video",
@@ -161,7 +187,8 @@ fn run(
             *pw::keys::MEDIA_ROLE => "Screen",
         },
     )?;
-    let buffers = serialize(buffer_param())?;
+    let mem_buffers = serialize(buffer_param(false))?;
+    let dma_buffers = serialize(buffer_param(true))?;
     let crop_meta = serialize(crop_param())?;
     let listener = stream.add_local_listener_with_user_data(StreamData {
         format: None,
@@ -170,7 +197,7 @@ fn run(
         layout: None,
     })
     .state_changed({
-        let fail = Rc::clone(&fail);
+        let fail = Rc::clone(fail);
         move |_, _, old, new| {
             diagnostic!("PipeWire stream state: {old:?} -> {new:?}");
             match new {
@@ -185,7 +212,7 @@ fn run(
         }
     })
     .param_changed({
-        let fail = Rc::clone(&fail);
+        let fail = Rc::clone(fail);
         let mailbox = Arc::clone(mailbox);
         move |stream, state, id, pod| {
             if id != ParamType::Format.as_raw() {
@@ -196,7 +223,12 @@ fn run(
             mailbox.lock().unwrap().frame = None;
             let Some(pod) = pod else { return };
             match negotiated_format(pod).and_then(|format| {
-                stream.update_params(&mut [pod_bytes(&buffers), pod_bytes(&crop_meta)])
+                let dma = format.flags().bits() & sys::SPA_VIDEO_FLAG_MODIFIER != 0;
+                if dma && (!prefer_linear || format.modifier() != DRM_FORMAT_MOD_LINEAR) {
+                    return Err(format!("unsupported DMA-BUF modifier {}", format.modifier()));
+                }
+                let buffers = if dma { &dma_buffers } else { &mem_buffers };
+                stream.update_params(&mut [pod_bytes(buffers), pod_bytes(&crop_meta)])
                     .map_err(|error| format!("negotiate PipeWire buffers: {error}"))?;
                 Ok(format)
             }) {
@@ -211,7 +243,10 @@ fn run(
         }
     })
     .process({
+        let fail = Rc::clone(fail);
         let mailbox = Arc::clone(mailbox);
+        let mainloop = mainloop.clone();
+        let retry = Rc::clone(&retry);
         move |stream, state| {
             // Keep the most recent buffer and return superseded ones to PipeWire immediately.
             let mut newest = None;
@@ -243,28 +278,37 @@ fn run(
                     drop(newest);
                     mailbox.lock().unwrap().frame = Some(frame);
                 }
+                Err(error) if prefer_linear && newest.is_dmabuf() => {
+                    diagnostic!("Could not read linear DMA-BUF: {error}; retrying with shared memory");
+                    retry.set(true);
+                    mainloop.quit();
+                }
                 Err(error) => fail(error),
             }
         }
     })
     .register()?;
 
-    let format = serialize(format_param())?;
+    let format = serialize(format_param(false))?;
+    let linear = prefer_linear
+        .then(|| serialize(format_param(true)))
+        .transpose()?;
+    let mut params: Vec<_> = linear.iter().map(|bytes| pod_bytes(bytes)).collect();
+    params.push(pod_bytes(&format));
     stream.connect(
         Direction::Input,
         Some(node_id),
         pw::stream::StreamFlags::AUTOCONNECT
             | pw::stream::StreamFlags::MAP_BUFFERS
             | pw::stream::StreamFlags::DONT_RECONNECT,
-        &mut [pod_bytes(&format)],
+        &mut params,
     )?;
     diagnostic!("PipeWire remote capture requested for node {node_id}");
     if failure.borrow().is_none() {
         mainloop.run();
     }
     drop(listener);
-    let result = failure.borrow_mut().take();
-    result.map_or(Ok(()), |message| Err(message.into()))
+    Ok(retry.get())
 }
 
 fn negotiated_format(pod: &Pod) -> Result<VideoInfoRaw, String> {
@@ -288,18 +332,11 @@ fn negotiated_format(pod: &Pod) -> Result<VideoInfoRaw, String> {
     Ok(format)
 }
 
-fn format_param() -> Object {
-    spa::pod::object!(
-        SpaTypes::ObjectParamFormat,
-        ParamType::EnumFormat,
-        spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
-        spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
-        spa::pod::property!(
-            FormatProperties::VideoFormat,
-            Choice,
-            Enum,
-            Id,
-            VideoFormat::BGRx,
+fn format_param(linear: bool) -> Object {
+    let formats = if linear {
+        vec![VideoFormat::BGRA, VideoFormat::BGRx]
+    } else {
+        vec![
             VideoFormat::BGRx,
             VideoFormat::BGRA,
             VideoFormat::RGBx,
@@ -309,8 +346,28 @@ fn format_param() -> Object {
             VideoFormat::xBGR,
             VideoFormat::ABGR,
             VideoFormat::RGB,
-            VideoFormat::BGR
-        ),
+            VideoFormat::BGR,
+        ]
+    };
+    let format = property(
+        FormatProperties::VideoFormat.as_raw(),
+        Value::Choice(spa::pod::ChoiceValue::Id(spa::utils::Choice(
+            spa::utils::ChoiceFlags::empty(),
+            spa::utils::ChoiceEnum::Enum {
+                default: Id(formats[0].as_raw()),
+                alternatives: formats
+                    .into_iter()
+                    .map(|format| Id(format.as_raw()))
+                    .collect(),
+            },
+        ))),
+    );
+    let mut param = spa::pod::object!(
+        SpaTypes::ObjectParamFormat,
+        ParamType::EnumFormat,
+        spa::pod::property!(FormatProperties::MediaType, Id, MediaType::Video),
+        spa::pod::property!(FormatProperties::MediaSubtype, Id, MediaSubtype::Raw),
+        format,
         spa::pod::property!(
             FormatProperties::VideoSize,
             Choice,
@@ -338,7 +395,15 @@ fn format_param() -> Object {
             Fraction { num: 0, denom: 1 },
             Fraction { num: 240, denom: 1 }
         ),
-    )
+    );
+    if linear {
+        param.properties.push(Property {
+            key: FormatProperties::VideoModifier.as_raw(),
+            flags: PropertyFlags::MANDATORY,
+            value: Value::Long(DRM_FORMAT_MOD_LINEAR as i64),
+        });
+    }
+    param
 }
 
 fn property(key: u32, value: Value) -> Property {
@@ -349,8 +414,12 @@ fn property(key: u32, value: Value) -> Property {
     }
 }
 
-fn buffer_param() -> Object {
-    let data_types = (1 << sys::SPA_DATA_MemFd) | (1 << sys::SPA_DATA_MemPtr);
+fn buffer_param(dma: bool) -> Object {
+    let data_types = if dma {
+        1 << sys::SPA_DATA_DmaBuf
+    } else {
+        (1 << sys::SPA_DATA_MemFd) | (1 << sys::SPA_DATA_MemPtr)
+    };
     Object {
         type_: SpaTypes::ObjectParamBuffers.as_raw(),
         id: ParamType::Buffers.as_raw(),
@@ -438,6 +507,11 @@ impl<'a> Dequeued<'a> {
         unsafe { buffer.datas.as_ref() }
     }
 
+    fn is_dmabuf(&self) -> bool {
+        self.plane()
+            .is_some_and(|plane| DataType::from_raw(plane.type_) == DataType::DmaBuf)
+    }
+
     fn has_frame(&self) -> Result<bool, String> {
         let plane = self.plane().ok_or("expected one RGB plane")?;
         let chunk = unsafe { plane.chunk.as_ref() }.ok_or("missing PipeWire chunk")?;
@@ -489,24 +563,40 @@ impl<'a> Dequeued<'a> {
     fn copy_frame(&self, format: &VideoInfoRaw) -> Result<(Frame, FrameLayout), String> {
         let plane = self.plane().ok_or("expected one RGB plane")?;
         let kind = DataType::from_raw(plane.type_);
-        if !matches!(kind, DataType::MemFd | DataType::MemPtr) {
-            return Err(format!("unsupported PipeWire buffer type {kind:?}"));
-        }
         let chunk = unsafe { plane.chunk.as_ref() }.ok_or("missing PipeWire chunk")?;
         let capacity = plane.maxsize as usize;
-        if plane.data.is_null() || capacity == 0 || capacity > isize::MAX as usize {
-            return Err(format!("unmapped PipeWire buffer ({kind:?})"));
+        if capacity == 0 || capacity > isize::MAX as usize {
+            return Err(format!("invalid PipeWire buffer capacity ({kind:?})"));
         }
         let offset = chunk.offset as usize % capacity;
         let length = (chunk.size as usize).min(capacity);
         if length > capacity - offset {
             return Err("non-contiguous PipeWire frame".into());
         }
-        // MAP_BUFFERS keeps this view mapped until the packet is returned to PipeWire.
-        let bytes =
-            unsafe { std::slice::from_raw_parts(plane.data.cast::<u8>().add(offset), length) };
         let crop = self.crop()?;
-        let frame = copy_pixels(bytes, chunk.stride, format.size(), format.format(), crop)?;
+        let copy =
+            |bytes: &[u8]| copy_pixels(bytes, chunk.stride, format.size(), format.format(), crop);
+        let frame = match kind {
+            DataType::DmaBuf if format.modifier() == DRM_FORMAT_MOD_LINEAR => {
+                let fd = libc::c_int::try_from(plane.fd).map_err(|_| "invalid DMA-BUF fd")?;
+                let start = (plane.mapoffset as usize)
+                    .checked_add(offset)
+                    .ok_or("DMA-BUF offset overflow")?;
+                copy_linear_dmabuf(fd, start, length, copy)?
+            }
+            DataType::MemFd | DataType::MemPtr if !plane.data.is_null() => {
+                // MAP_BUFFERS keeps this view mapped until the packet is returned to PipeWire.
+                let bytes = unsafe {
+                    std::slice::from_raw_parts(plane.data.cast::<u8>().add(offset), length)
+                };
+                copy(bytes)?
+            }
+            _ => {
+                return Err(format!(
+                    "unsupported or unmapped PipeWire buffer ({kind:?})"
+                ));
+            }
+        };
         Ok((
             frame,
             FrameLayout {
@@ -516,6 +606,60 @@ impl<'a> Dequeued<'a> {
                 crop,
             },
         ))
+    }
+}
+
+fn copy_linear_dmabuf(
+    fd: libc::c_int,
+    offset: usize,
+    length: usize,
+    copy: impl FnOnce(&[u8]) -> Result<Frame, String>,
+) -> Result<Frame, String> {
+    let end = offset
+        .checked_add(length)
+        .filter(|&end| end <= isize::MAX as usize)
+        .ok_or("DMA-BUF range overflow")?;
+    // DMA-BUFs expose their size via SEEK_END. Avoid a mapping that would fault on read.
+    let size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
+    if usize::try_from(size).is_err() || end > size as usize || length == 0 {
+        return Err("DMA-BUF frame is outside the exported buffer".into());
+    }
+    let mapping = unsafe {
+        libc::mmap(
+            std::ptr::null_mut(),
+            end,
+            libc::PROT_READ,
+            libc::MAP_SHARED,
+            fd,
+            0,
+        )
+    };
+    if mapping == libc::MAP_FAILED {
+        return Err(format!("map DMA-BUF: {}", io::Error::last_os_error()));
+    }
+
+    let result = sync_dmabuf(fd, 1).and_then(|()| {
+        // The PipeWire packet remains dequeued until this CPU access ends.
+        let bytes = unsafe { std::slice::from_raw_parts(mapping.cast::<u8>().add(offset), length) };
+        let frame = copy(bytes);
+        let sync = sync_dmabuf(fd, 1 | (1 << 2));
+        frame.and_then(|frame| sync.map(|()| frame))
+    });
+    unsafe { libc::munmap(mapping, end) };
+    result
+}
+
+fn sync_dmabuf(fd: libc::c_int, flags: u64) -> Result<(), String> {
+    // DMA_BUF_IOCTL_SYNC from linux/dma-buf.h, with DMA_BUF_SYNC_READ on both calls.
+    let request = libc::_IOW::<u64>(b'b' as u32, 0);
+    loop {
+        if unsafe { libc::ioctl(fd, request, &flags) } == 0 {
+            return Ok(());
+        }
+        let error = io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EINTR | libc::EAGAIN)) {
+            return Err(format!("synchronize DMA-BUF: {error}"));
+        }
     }
 }
 

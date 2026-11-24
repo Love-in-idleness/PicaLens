@@ -11,7 +11,8 @@ mkdir -p -- "$build_dir"
 case "$ID:$VERSION_CODENAME" in
     debian:trixie) target=debian13 ;;
     ubuntu:stonking) target=ubuntu26.10 ;;
-    *) printf 'Build on Debian 13 or Ubuntu 26.10.\n' >&2; exit 1 ;;
+    ubuntu:tenacious) target=ubuntu27.04 ;;
+    *) printf 'Build on Debian 13, Ubuntu 26.10, or Ubuntu 27.04.\n' >&2; exit 1 ;;
 esac
 
 kwin_version=$(dpkg-query -W -f='${Version}' kwin-dev)
@@ -48,6 +49,12 @@ install -Dm755 "$CARGO_TARGET_DIR/release/picalens" "$stage/usr/bin/picalens"
 strip --strip-unneeded "$stage/usr/bin/picalens"
 install -Dm644 data/io.github.LoveInIdleness.PicaLens.desktop \
     "$stage/usr/share/applications/io.github.LoveInIdleness.PicaLens.desktop"
+gnome_extension=picalens@love-in-idleness.github.io
+install -Dm644 -t "$stage/usr/share/gnome-shell/extensions/$gnome_extension" \
+    "gnome/$gnome_extension/metadata.json" "gnome/$gnome_extension/extension.js"
+install -d "$stage/usr/share/kglobalaccel"
+ln -s ../applications/io.github.LoveInIdleness.PicaLens.desktop \
+    "$stage/usr/share/kglobalaccel/io.github.LoveInIdleness.PicaLens.desktop"
 docs=$stage/usr/share/doc/picalens
 install -Dm644 packaging/copyright "$docs/copyright"
 host=$(rustc --print host-tuple)
@@ -72,11 +79,13 @@ Maintainer: PicaLens <93856868+Love-in-idleness@users.noreply.github.com>
 Installed-Size: $(du -sk "$stage/usr" | cut -f1)
 Depends: $depends
 Recommends: pipewire, wireplumber, xdg-desktop-portal
-Suggests: kwin-wayland, xdg-desktop-portal-kde
+Suggests: kwin-wayland, xdg-desktop-portal-kde, gnome-shell, gamescope
 Homepage: https://github.com/Love-in-idleness/PicaLens
-Description: Magnify an open window on Plasma Wayland
- PicaLens interactively magnifies existing native Wayland and XWayland windows
- on Plasma. Open it from the application launcher or run picalens toggle.
+Description: Magnify Wayland windows and launch games with Gamescope
+ PicaLens offers interactive magnification with its Plasma and GNOME Shell
+ components, and Portal previews on compatible desktops. It can also launch
+ games with the optional Gamescope package. Open it from the application
+ launcher or run picalens toggle.
 EOF
 
 # Let KWin discover the optional plugin only while its packaged ABI matches.

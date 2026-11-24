@@ -19,6 +19,12 @@ use crate::{capture::Capture, input::EisInput, preview::Preview};
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub type Stop = oneshot::Receiver<&'static str>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Target {
+    Active,
+    Choose,
+}
+
 pub async fn diagnostics() -> Result<()> {
     for key in ["XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "WAYLAND_DISPLAY"] {
         println!("{key}={}", std::env::var(key).unwrap_or_default());

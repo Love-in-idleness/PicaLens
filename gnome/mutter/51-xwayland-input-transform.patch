@@ -1,0 +1,105 @@
+--- a/src/compositor/meta-window-actor.c
++++ b/src/compositor/meta-window-actor.c
+@@ -58,6 +58,7 @@
+   int n_obscured_surfaces;
+   int n_mapped_surfaces;
+   gboolean is_effectively_visible;
++  gboolean transform_xwayland_input;
+ 
+   /*
+    * These need to be counters rather than flags, since more plugins
+@@ -102,6 +103,7 @@
+   PROP_0,
+ 
+   PROP_META_WINDOW,
++  PROP_TRANSFORM_XWAYLAND_INPUT,
+ 
+   N_PROPS
+ };
+@@ -278,6 +280,10 @@
+     g_param_spec_object ("meta-window", NULL, NULL,
+                          META_TYPE_WINDOW,
+                          G_PARAM_READWRITE | G_PARAM_CONSTRUCT_ONLY | G_PARAM_STATIC_NAME);
++  obj_props[PROP_TRANSFORM_XWAYLAND_INPUT] =
++    g_param_spec_boolean ("transform-xwayland-input", NULL,
++                          "Map Xwayland pointer coordinates through the actor transform",
++                          FALSE, G_PARAM_READWRITE | G_PARAM_STATIC_STRINGS);
+   g_object_class_install_properties (object_class, N_PROPS, obj_props);
+ }
+ 
+@@ -704,6 +710,9 @@
+       g_signal_connect_object (priv->window, "notify::appears-focused",
+                                G_CALLBACK (window_appears_focused_notify), self, 0);
+       break;
++    case PROP_TRANSFORM_XWAYLAND_INPUT:
++      priv->transform_xwayland_input = g_value_get_boolean (value);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+@@ -725,10 +734,22 @@
+     case PROP_META_WINDOW:
+       g_value_set_object (value, priv->window);
+       break;
++    case PROP_TRANSFORM_XWAYLAND_INPUT:
++      g_value_set_boolean (value, priv->transform_xwayland_input);
++      break;
+     default:
+       G_OBJECT_WARN_INVALID_PROPERTY_ID (object, prop_id, pspec);
+       break;
+     }
++}
++
++gboolean
++meta_window_actor_get_transform_xwayland_input (MetaWindowActor *self)
++{
++  MetaWindowActorPrivate *priv =
++    meta_window_actor_get_instance_private (self);
++
++  return priv->transform_xwayland_input;
+ }
+ 
+ /**
+--- a/src/compositor/meta-window-actor-private.h
++++ b/src/compositor/meta-window-actor-private.h
+@@ -93,6 +93,8 @@
+ META_EXPORT_TEST
+ MetaWindowActor *meta_window_actor_from_window (MetaWindow *window);
+ 
++gboolean meta_window_actor_get_transform_xwayland_input (MetaWindowActor *self);
++
+ META_EXPORT_TEST
+ MetaWindowActor *meta_window_actor_from_actor (ClutterActor *actor);
+ 
+--- a/src/wayland/meta-xwayland-surface.c
++++ b/src/wayland/meta-xwayland-surface.c
+@@ -178,7 +178,28 @@
+   int xwayland_scale = surface->applied_state.scale;
+ 
+   if (xwayland_surface->window)
+-    meta_window_get_buffer_rect (xwayland_surface->window, &window_rect);
++    {
++      MetaWindowActor *window_actor =
++        meta_window_actor_from_window (xwayland_surface->window);
++
++      meta_window_get_buffer_rect (xwayland_surface->window, &window_rect);
++
++      if (window_actor &&
++          meta_window_actor_get_transform_xwayland_input (window_actor))
++        {
++          ClutterActor *actor = CLUTTER_ACTOR (window_actor);
++          float local_x, local_y;
++
++          /* Convert to the untransformed stage position. Keep Xwayland's
++           * existing buffer origin and surface scale conversion below. */
++          if (clutter_actor_transform_stage_point (actor, abs_x, abs_y,
++                                                   &local_x, &local_y))
++            {
++              abs_x = clutter_actor_get_x (actor) + local_x;
++              abs_y = clutter_actor_get_y (actor) + local_y;
++            }
++        }
++    }
+ 
+   *out_sx = (abs_x - window_rect.x) * xwayland_scale;
+   *out_sy = (abs_y - window_rect.y) * xwayland_scale;
