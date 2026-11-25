@@ -1,5 +1,7 @@
 # PicaLens（鹊镜）
 
+<img src="data/io.github.LoveInIdleness.PicaLens.png" alt="PicaLens 图标，方形黄铜望远镜中的像素鹦鹉" width="144">
+
 实时放大 Wayland 会话中已打开的窗口，也能通过 Gamescope 启动游戏。PicaLens 读作 *PIE-kuh lens*。
 
 ## 安装预览版

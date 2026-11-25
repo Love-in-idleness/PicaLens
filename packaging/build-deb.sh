@@ -49,6 +49,8 @@ install -Dm755 "$CARGO_TARGET_DIR/release/picalens" "$stage/usr/bin/picalens"
 strip --strip-unneeded "$stage/usr/bin/picalens"
 install -Dm644 data/io.github.LoveInIdleness.PicaLens.desktop \
     "$stage/usr/share/applications/io.github.LoveInIdleness.PicaLens.desktop"
+install -Dm644 data/io.github.LoveInIdleness.PicaLens.png \
+    "$stage/usr/share/pixmaps/io.github.LoveInIdleness.PicaLens.png"
 gnome_extension=picalens@love-in-idleness.github.io
 install -Dm644 -t "$stage/usr/share/gnome-shell/extensions/$gnome_extension" \
     "gnome/$gnome_extension/metadata.json" "gnome/$gnome_extension/extension.js"
