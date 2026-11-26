@@ -583,15 +583,19 @@ impl View {
 
     fn show_mode(&self) {
         let preset = self.active_preset();
-        let key = if interactive_gpu(&preset) {
+        let preview_only = portal_required(&preset);
+        let desktop = native::Desktop::current();
+        let key = if !preview_only && matches!(desktop, Some(native::Desktop::Treeland)) {
+            "backend_treeland_in_progress"
+        } else if interactive_gpu(&preset) {
             "backend_gpu_auto"
-        } else if portal_required(&preset) {
+        } else if preview_only {
             "backend_portal"
         } else if is_plasma() {
             "backend_auto"
         } else if is_gnome() {
             "backend_gnome_auto"
-        } else if preset.layout == Layout::Fit && native::Desktop::current().is_some() {
+        } else if preset.layout == Layout::Fit && desktop.is_some() {
             "backend_native_auto"
         } else {
             "backend_portal"

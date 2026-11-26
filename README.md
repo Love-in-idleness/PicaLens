@@ -32,9 +32,9 @@ niri 26.04 和 Hyprland 0.53.3 的 PicaLens 后端支持等比全屏，滤镜可
 
 `picalens toggle` 打开选窗器，再按一次结束放大。niri 的 `binds` 中可添加 `Mod+F8 { spawn "picalens" "toggle"; }`。使用 Hyprlang 配置的 Hyprland 可添加 `bind = SUPER, F8, exec, picalens toggle`，使用 Lua 配置的版本可将同一命令绑定到执行调度器。
 
-### DDE Wayland（Treeland）
+### DDE Wayland（Treeland）｜适配中
 
-DDE Wayland 使用同一个「选择窗口」入口和 `picalens toggle` 命令。等比交互全屏需要带 PicaLens 后端的 Treeland 构建，可使用线性、FSR 1 和 SGSR 操作原生 Wayland 与 XWayland 应用。兼容的 Treeland 构建仍待发布。窗口预览可使用提供窗口来源的 `xdg-desktop-portal-dde` 与 PipeWire。 [Treeland 后端与使用](docs/treeland-experiment.md)
+DDE Wayland 的交互全屏仍在适配中，相关开发暂缓。实验构建已在虚拟机中验证，发行版自带的 Treeland 仍待验收。系统 Portal 提供窗口采集时，可以使用只读预览。 [实验记录](docs/treeland-experiment.md) · [Treeland 功能讨论](https://github.com/linuxdeepin/treeland/issues/1728)
 
 ### GNOME
 
