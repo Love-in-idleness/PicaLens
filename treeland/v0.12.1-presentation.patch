@@ -1,0 +1,67 @@
+--- a/src/CMakeLists.txt
++++ b/src/CMakeLists.txt
+@@ -389,6 +389,8 @@
+ endif()
+ 
+ 
++add_subdirectory(picalens)
++
+ # Liquid Glass shaders are used with ShaderEffect, not custom QSGGeometry,
+ # so BATCHABLE is unnecessary (it only adds an unused batchable variant).
+ qt_add_shaders(libtreeland "treeland_liquidglass_shaders"
+--- a/src/core/waylandserver.cpp
++++ b/src/core/waylandserver.cpp
+@@ -2,6 +2,7 @@
+ // SPDX-License-Identifier: Apache-2.0 OR LGPL-3.0-only OR GPL-2.0-only OR GPL-3.0-only
+ 
+ #include "waylandserver.h"
++#include "picalens/picalenspresentation.h"
+ #include "session/sessionmanager.h"
+ #include "session/sessionmultitaskview.h"
+ #include "lockscreen/lockscreenmanager.h"
+@@ -721,6 +722,7 @@
+     // initialization and fallen back to defaults.
+     startBackend();
+     m_outputManager->backendStarted();
++    new PicaLensPresentation(this);
+ }
+ 
+ SeatManager *WaylandServer::seatManager() const
+--- a/waylib/src/server/platformplugin/qwlrootsintegration.cpp
++++ b/waylib/src/server/platformplugin/qwlrootsintegration.cpp
+@@ -43,6 +43,8 @@
+ #include <qpa/qplatformopenglcontext.h>
+ #include <private/qeglconvenience_p.h>
+ #include <EGL/egl.h>
++
++#include <cstdio>
+ 
+ #endif // QT_NO_OPENGL
+ 
+@@ -310,6 +312,26 @@
+             auto eglConfig = q_configFromGLFormat(c->eglDisplay(), m_format, false, EGL_PBUFFER_BIT);
+             if (eglConfig)
+                 m_format = q_glFormatFromConfig(c->eglDisplay(), eglConfig, m_format);
++            // EGLConfig lists supported APIs, not the version of this context.
++            const auto previousDisplay = eglGetCurrentDisplay();
++            const auto previousContext = eglGetCurrentContext();
++            const auto previousDraw = eglGetCurrentSurface(EGL_DRAW);
++            const auto previousRead = eglGetCurrentSurface(EGL_READ);
++            if (eglMakeCurrent(c->eglDisplay(), EGL_NO_SURFACE, EGL_NO_SURFACE, c->eglContext())) {
++                using ReadString = const GLubyte* (*)(GLenum);
++                const auto readString = reinterpret_cast<ReadString>(eglGetProcAddress("glGetString"));
++                if (readString) {
++                    int major = 0;
++                    int minor = 0;
++                    const auto version = reinterpret_cast<const char*>(readString(GL_VERSION));
++                    if (version && std::sscanf(version, "OpenGL ES %d.%d", &major, &minor) == 2)
++                        m_format.setVersion(major, minor);
++                }
++                if (previousContext == EGL_NO_CONTEXT)
++                    eglMakeCurrent(c->eglDisplay(), EGL_NO_SURFACE, EGL_NO_SURFACE, EGL_NO_CONTEXT);
++                else
++                    eglMakeCurrent(previousDisplay, previousDraw, previousRead, previousContext);
++            }
+             Q_ASSERT(m_format.renderableType() == QSurfaceFormat::OpenGLES);
+         } else {
+             qCWarning(lcWlPlatform) << "The QSurfaceFormat is not initialize";

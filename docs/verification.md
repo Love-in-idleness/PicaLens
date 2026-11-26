@@ -96,11 +96,13 @@ Plasma 另在 1920×1080 @ 150% 通过了 SGSR 与 XWayland 的交互复测。Hy
 
 在 QEMU/VirGL 的 Hyprland `0.53.3+ds-4` 会话中加载匹配的后台组件。从 PicaLens 界面的「选择窗口」和 `toggle` 分别开始放大。原生 Wayland、XWayland 源窗各依序收到 1–9 点位、滚轮和 A 键。XWayland 记录到两个方向的非零滚轮增量。黑边输入未送达源窗，观察窗未记录误投。Esc、再次 `toggle`、关闭源窗和切换焦点均结束放大。两款交互后端均在 100% 输出缩放下验收。 [构建与试用](hyprland-experiment.md)
 
-### DDE Wayland 接入检查
+### DDE Wayland 的 Treeland 0.12.1
 
-仅为 PicaLens 进程设置 `XDG_CURRENT_DESKTOP=DDE`，沿用 niri 会话提供的窗口流。`picalens toggle` 打开系统选窗器，选中原生 Wayland 测试窗后持续接收 538×786 BGRx DMA-BUF 帧，再次执行命令结束会话。实际 Treeland 会话中的原生 Wayland 与 XWayland 选窗和取帧仍待验收。 [DDE Portal 单窗流实现](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/7f1721594b424161a90afe4ecdc936f6fd8767c0/src/wayland/treelandintegration.cpp#L112)
+从 GitHub 获取 Treeland 0.12.1、dde-wlroots 0.20.2.1 等源码，构建依赖使用 Ubuntu 软件包归档。在 Ubuntu 26.10 虚拟机中启动真实 Treeland，使用 VirGL、OpenGL ES 3.1 以上、640×480 @ 100%。测试会话直接启动合成器，完整 DDM 登录流程与物理显卡性能仍待验收。 [构建与使用](treeland-experiment.md)
 
-已从 GitHub 获取 Treeland 0.12.1 源码。德国 FAU、澳大利亚 AARNet、瑞典 Lysator 和日本 JAIST 的 Deepin 镜像在当前云工作区的代理检查中均返回 CONNECT 403。FAU 域名访问请求未获批准。该版本的 Treeland 屏幕缩放动作仍是占位实现，DDE Portal 的 Wayland 上下文只创建 ScreenCast 等已实现接口。 [Deepin 社区镜像](https://www.deepin.org/en/mirrors/packages/) · [Treeland 0.12.1](https://github.com/linuxdeepin/treeland/tree/0.12.1) · [DDE Portal 上下文](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/7f1721594b424161a90afe4ecdc936f6fd8767c0/src/wayland/portalwaylandcontext.cpp)
+在 Treeland 会话中选中原生 Wayland 或 XWayland 源窗，两类窗口在 FSR 1 和 SGSR 下均依次收到九个位置的点击、双向滚轮和 A 键按下及释放。黑边的点击和滚轮未送达源窗或观察窗。关闭正在放大的原生 Wayland 窗口后，可以继续选择并放大 XWayland 窗口。XWayland 的 `:0` 已通过 `xdpyinfo -queryExtensions` 确认具有 XWAYLAND 扩展。
+
+使用构建产物内置的着色器复测时，XWayland 源窗先后运行 FSR 1、SGSR、线性和 FSR 1。同一静态区域的截图逐像素比较确认三种滤镜产生各自的渲染结果。
 
 ### Plasma 6 Wayland 验收
 

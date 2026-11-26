@@ -1,4 +1,4 @@
-use std::{os::unix::ffi::OsStrExt, path::Path, time::Duration};
+use std::{mem::MaybeUninit, os::unix::ffi::OsStrExt, path::Path, ptr, time::Duration};
 
 use futures_util::FutureExt;
 use gtk::{gio, glib, prelude::*};
@@ -14,6 +14,7 @@ pub const FINISHED: &str = "native presentation finished";
 pub enum Desktop {
     Niri,
     Hyprland,
+    Treeland,
 }
 
 impl Desktop {
@@ -22,6 +23,8 @@ impl Desktop {
             Some(Self::Niri)
         } else if desktop_matches(&["Hyprland"]) {
             Some(Self::Hyprland)
+        } else if desktop_matches(&["DDE", "Deepin", "Treeland"]) {
+            Some(Self::Treeland)
         } else {
             None
         }
@@ -31,6 +34,7 @@ impl Desktop {
         match self {
             Self::Niri => "niri",
             Self::Hyprland => "hyprland",
+            Self::Treeland => "treeland",
         }
     }
 
@@ -38,6 +42,7 @@ impl Desktop {
         match self {
             Self::Niri => "backend_niri",
             Self::Hyprland => "backend_hyprland",
+            Self::Treeland => "backend_treeland",
         }
     }
 
@@ -46,6 +51,13 @@ impl Desktop {
             Self::Niri => Some(gio::UnixSocketAddress::new(Path::new(&std::env::var_os(
                 "NIRI_SOCKET",
             )?))),
+            Self::Treeland => {
+                // DDE can expose the same session through more than one Wayland socket.
+                let name = format!("picalens-treeland-{}", unsafe { libc::geteuid() });
+                Some(gio::UnixSocketAddress::with_type(
+                    UnixSocketAddressPath::Abstract(name.as_bytes()),
+                ))
+            }
             Self::Hyprland => {
                 let instance = std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE")?;
                 // Hyprland's runtime directory can exceed the pathname socket limit.
@@ -58,6 +70,23 @@ impl Desktop {
             }
         }
     }
+}
+
+fn treeland_daemon_uid() -> Option<libc::uid_t> {
+    // Packaged Treeland runs under the system's dde account across login sessions.
+    let mut record = MaybeUninit::<libc::passwd>::uninit();
+    let mut result = ptr::null_mut();
+    let mut buffer = [0_u8; 16384];
+    let status = unsafe {
+        libc::getpwnam_r(
+            c"dde".as_ptr(),
+            record.as_mut_ptr(),
+            buffer.as_mut_ptr().cast(),
+            buffer.len(),
+            &mut result,
+        )
+    };
+    (status == 0 && !result.is_null()).then(|| unsafe { record.assume_init().pw_uid })
 }
 
 pub struct Backend {
@@ -99,7 +128,9 @@ pub async fn discover(desktop: Desktop, filter: Filter) -> Option<Backend> {
             .await
             .ok()?;
         let uid = connection.socket().credentials().ok()?.unix_user().ok()?;
-        if uid != unsafe { libc::geteuid() } {
+        if uid != unsafe { libc::geteuid() }
+            && !(matches!(desktop, Desktop::Treeland) && treeland_daemon_uid() == Some(uid))
+        {
             return None;
         }
         let replies = gio::DataInputStream::new(&connection.input_stream());

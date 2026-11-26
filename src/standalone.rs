@@ -676,9 +676,11 @@ impl View {
         if interactive_gpu && preset.layout == Layout::Integer {
             return Err("interactive_filter_unavailable".into());
         }
-        if !portal_required(preset)
+        let preview_only = portal_required(preset);
+        let desktop = native::Desktop::current();
+        if !preview_only
             && preset.layout == Layout::Fit
-            && let Some(desktop) = native::Desktop::current()
+            && let Some(desktop) = desktop
         {
             let backend = futures_util::select_biased! {
                 reason = stop => return Ok(reason.unwrap_or("application shutdown").into()),
@@ -690,7 +692,10 @@ impl View {
                 return native::magnify(backend, stop, preset.filter).await;
             }
         }
-        let needs_portal = portal_required(preset) || session::portal_desktop();
+        if !preview_only && matches!(desktop, Some(native::Desktop::Treeland)) {
+            return Err("treeland_interactive_unavailable".into());
+        }
+        let needs_portal = preview_only || session::portal_desktop();
         if needs_portal && target == Target::Active && !interactive_gpu {
             return Err("active_window_preset".into());
         }
@@ -999,6 +1004,7 @@ impl View {
                     | "gnome_source_lost"
                     | "native_backend_lost"
                     | "native_backend_busy"
+                    | "treeland_interactive_unavailable"
                     | "interactive_filter_unavailable"
                     | "no_active_window"
                     | "active_window_preset"
