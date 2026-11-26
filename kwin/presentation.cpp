@@ -62,8 +62,8 @@ std::optional<Presentation> presentationFor(KWin::EffectWindow *window, Layout l
     return Presentation{output, outputRect, source, QRect(origin, size)};
 }
 
-static void clearGlDamage(const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
-                          const Damage &damage)
+void clearGlDamage(const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
+                   const Damage &damage)
 {
     const bool hadScissor = glIsEnabled(GL_SCISSOR_TEST);
     GLint previousScissor[4];

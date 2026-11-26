@@ -1,0 +1,11 @@
+#pragma once
+
+namespace PicaLens::Shaders {
+
+inline constexpr auto fsr = R"GLSL(@fsr1@)GLSL";
+inline constexpr auto easu = R"GLSL(@easu_pass@)GLSL";
+inline constexpr auto rcas = R"GLSL(@rcas_pass@)GLSL";
+inline constexpr auto sgsr = R"GLSL(@sgsr1@
+@sgsr_pass@)GLSL";
+
+}

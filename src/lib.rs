@@ -14,6 +14,7 @@ mod gpu;
 mod input;
 mod kwin;
 mod locale;
+mod native;
 mod preview;
 mod probe;
 mod session;

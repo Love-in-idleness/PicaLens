@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 
+#include "gpu_presentation.h"
 #include "inputfilter.h"
 #include "presentation.h"
 
@@ -144,12 +145,15 @@ public:
             || !damage.intersects(PicaLens::paintRect(viewport, m_presentation->outputRect))) {
             return;
         }
-        if (!PicaLens::paintPresentation(m_window, *m_presentation, target, viewport, damage)) {
+        const bool painted = m_gpu
+            ? m_gpu->paint(m_window, *m_presentation, target, viewport, damage)
+            : PicaLens::paintPresentation(m_window, *m_presentation, target, viewport, damage);
+        if (!painted) {
             if (!m_failedPaint) {
                 m_failedPaint = true;
                 QTimer::singleShot(0, this, [this] {
                     if (m_failedPaint) {
-                        stop("presentation could not be drawn");
+                        stop(m_gpu ? "interactive_filter_unavailable" : "presentation could not be drawn");
                     }
                 });
             }
@@ -162,7 +166,7 @@ public:
             m_firstPaint = true;
             m_input.setPresentation(m_source, m_presentation->outputRect,
                                     m_presentation->destination, m_presentation->source);
-            qInfo("picalens first frame drawn");
+            qInfo("picalens first frame drawn filter=%s", qPrintable(filterName(m_filter)));
         }
     }
 
@@ -201,6 +205,14 @@ public Q_SLOTS:
         return {QStringLiteral("fit"), QStringLiteral("stretch"), QStringLiteral("fill")};
     }
 
+    Q_SCRIPTABLE QStringList SupportedFilters() const
+    {
+        if (effects->isOpenGLCompositing()) {
+            return {QStringLiteral("linear"), QStringLiteral("fsr"), QStringLiteral("sgsr")};
+        }
+        return {QStringLiteral("linear")};
+    }
+
     Q_SCRIPTABLE bool StartWithLayout(const QString &layout)
     {
         const auto parsed = parseLayout(layout);
@@ -208,6 +220,35 @@ public Q_SLOTS:
     }
 
     Q_SCRIPTABLE bool StartActive(const QString &layout)
+    {
+        return startActive(layout, PicaLens::Filter::Linear);
+    }
+
+    Q_SCRIPTABLE bool StartWithFilter(const QString &layout, const QString &filter)
+    {
+        const auto parsed = parseLayout(layout);
+        const auto selected = parseGpuFilter(filter);
+        return parsed && selected && effects->isOpenGLCompositing() && startSelection(*parsed, *selected);
+    }
+
+    Q_SCRIPTABLE bool StartActiveWithFilter(const QString &layout, const QString &filter)
+    {
+        const auto selected = parseGpuFilter(filter);
+        return selected && effects->isOpenGLCompositing() && startActive(layout, *selected);
+    }
+
+    Q_SCRIPTABLE void Stop()
+    {
+        if (calledFromDBus() && m_owner.watchedServices().contains(message().service())) {
+            stop("PicaLens requested stop");
+        }
+    }
+
+Q_SIGNALS:
+    Q_SCRIPTABLE void Finished(const QString &reason, bool returnToControls);
+
+private:
+    bool startActive(const QString &layout, PicaLens::Filter filter)
     {
         const auto parsed = parseLayout(layout);
         if (!parsed || !canStart()) {
@@ -222,20 +263,30 @@ public Q_SLOTS:
         }
         m_owner.addWatchedService(message().service());
         m_layout = *parsed;
+        m_filter = filter;
         return start(window);
     }
 
-    Q_SCRIPTABLE void Stop()
+    static QString filterName(PicaLens::Filter filter)
     {
-        if (calledFromDBus() && m_owner.watchedServices().contains(message().service())) {
-            stop("PicaLens requested stop");
+        switch (filter) {
+        case PicaLens::Filter::Fsr: return QStringLiteral("fsr");
+        case PicaLens::Filter::Sgsr: return QStringLiteral("sgsr");
+        case PicaLens::Filter::Linear: return QStringLiteral("linear");
         }
+        Q_UNREACHABLE_RETURN(QString());
     }
 
-Q_SIGNALS:
-    Q_SCRIPTABLE void Finished(const QString &reason, bool returnToControls);
+    static std::optional<PicaLens::Filter> parseGpuFilter(const QString &name)
+    {
+        for (const auto filter : {PicaLens::Filter::Fsr, PicaLens::Filter::Sgsr}) {
+            if (filterName(filter) == name) {
+                return filter;
+            }
+        }
+        return std::nullopt;
+    }
 
-private:
     static std::optional<PicaLens::Layout> parseLayout(const QString &layout)
     {
         if (layout == QStringLiteral("stretch")) {
@@ -257,13 +308,14 @@ private:
             && !effects->isMouseInterception() && !input()->isSelectingWindow();
     }
 
-    bool startSelection(PicaLens::Layout layout)
+    bool startSelection(PicaLens::Layout layout, PicaLens::Filter filter = PicaLens::Filter::Linear)
     {
         if (!canStart() || !effects->grabKeyboard(this)) {
             return false;
         }
         m_owner.addWatchedService(message().service());
         m_layout = layout;
+        m_filter = filter;
         m_selecting = true;
         effects->startMouseInterception(this, Qt::CrossCursor);
         qInfo("picalens selecting an existing window");
@@ -402,6 +454,9 @@ private:
         m_source = source;
         m_fallbackCursor.setTheme(input()->pointer()->cursorTheme());
         m_presentation = presentation;
+        if (m_filter != PicaLens::Filter::Linear) {
+            m_gpu = std::make_unique<PicaLens::GpuPresentation>(m_filter);
+        }
         source->refOffscreenRendering();
         connect(window, &EffectWindow::windowDamaged, this, [this] {
             repaintOutput(m_presentation->outputRect);
@@ -454,6 +509,13 @@ private:
         }
         const QRect repaint = m_presentation->outputRect;
         m_presentation.reset();
+        if (m_gpu) {
+            const bool current = effects->makeOpenGLContextCurrent();
+            m_gpu.reset();
+            if (current) {
+                effects->doneOpenGLContextCurrent();
+            }
+        }
         m_firstPaint = false;
         m_failedPaint = false;
         m_input.clear();
@@ -487,6 +549,8 @@ private:
     std::optional<PicaLens::Presentation> m_presentation;
     PicaLensInputFilter m_input;
     PicaLens::Layout m_layout = PicaLens::Layout::Fit;
+    PicaLens::Filter m_filter = PicaLens::Filter::Linear;
+    std::unique_ptr<PicaLens::GpuPresentation> m_gpu;
     bool m_registered = false;
     bool m_selecting = false;
     bool m_firstPaint = false;

@@ -1,0 +1,20 @@
+cmake_minimum_required(VERSION 3.24)
+project(PicaLensHyprland LANGUAGES CXX)
+
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(HYPRLAND REQUIRED IMPORTED_TARGET hyprland)
+pkg_check_modules(GLES REQUIRED IMPORTED_TARGET glesv2)
+
+foreach(shader IN ITEMS fsr1 sgsr1 easu-pass rcas-pass sgsr-pass)
+    set(file "${CMAKE_CURRENT_SOURCE_DIR}/../src/shaders/${shader}.glsl")
+    set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${file}")
+    string(REPLACE "-" "_" variable "${shader}")
+    file(READ "${file}" ${variable})
+endforeach()
+configure_file(shaders.h.in picalens-shaders.h @ONLY)
+
+add_library(picalens-hyprland MODULE presentation.cpp gpu.cpp)
+target_compile_features(picalens-hyprland PRIVATE cxx_std_23)
+set_target_properties(picalens-hyprland PROPERTIES PREFIX "")
+target_link_libraries(picalens-hyprland PRIVATE PkgConfig::HYPRLAND PkgConfig::GLES)
+target_include_directories(picalens-hyprland PRIVATE "${CMAKE_CURRENT_BINARY_DIR}")

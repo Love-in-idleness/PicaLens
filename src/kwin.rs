@@ -6,7 +6,7 @@ use gtk::{gio, glib, prelude::*};
 
 use crate::{
     session::{Result, Stop},
-    settings::Layout,
+    settings::{Filter, Layout},
 };
 
 const SERVICE: &str = "org.kde.KWin";
@@ -59,6 +59,24 @@ pub async fn supports_layout(backend: &Proxy<'_>, layout: Layout) -> Result<bool
     }
 }
 
+pub async fn supports_filter(backend: &Proxy<'_>, filter: Filter) -> Result<bool> {
+    if filter == Filter::Linear {
+        return Ok(true);
+    }
+    match backend
+        .call::<_, _, Vec<String>>("SupportedFilters", &())
+        .await
+    {
+        Ok(filters) => Ok(filters.iter().any(|id| id == filter.id())),
+        Err(zbus::Error::MethodError(name, ..))
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn active_call(
     conn: &gio::DBusConnection,
     method: &str,
@@ -82,18 +100,31 @@ pub async fn magnify(
     backend: Proxy<'_>,
     mut stop: Stop,
     layout: Layout,
+    filter: Filter,
     active: Option<&gio::DBusConnection>,
 ) -> Result<String> {
     let mut finished = backend.receive_signal("Finished").await?;
     let mut owner = backend.receive_owner_changed().await?;
     let started: bool = if let Some(conn) = active {
-        match active_call(conn, "StartActive", Some(&(layout.id(),).to_variant())).await {
+        let (method, args) = if filter.uses_gpu() {
+            (
+                "StartActiveWithFilter",
+                (layout.id(), filter.id()).to_variant(),
+            )
+        } else {
+            ("StartActive", (layout.id(),).to_variant())
+        };
+        match active_call(conn, method, Some(&args)).await {
             Ok(reply) => reply.get::<(bool,)>().ok_or("active_window_backend")?.0,
             Err(error) if error.matches(gio::DBusError::UnknownMethod) => {
                 return Err("active_window_backend".into());
             }
             Err(error) => return Err(error.into()),
         }
+    } else if filter.uses_gpu() {
+        backend
+            .call("StartWithFilter", &(layout.id(), filter.id()))
+            .await?
     } else {
         match layout {
             Layout::Fit => backend.call("Start", &()).await?,
@@ -116,7 +147,10 @@ pub async fn magnify(
                 .into(),
         );
     }
-    diagnostic!("picalens backend=kwin mode=interactive");
+    diagnostic!(
+        "picalens backend=kwin mode=interactive filter={}",
+        filter.id()
+    );
     futures_util::select_biased! {
         reason = stop => {
             if let Some(conn) = active {
@@ -129,6 +163,9 @@ pub async fn magnify(
         signal = finished.next().fuse() => {
             let signal = signal.ok_or("PicaLens lost the KWin backend")?;
             let (reason, _): (String, bool) = signal.body().deserialize()?;
+            if reason == "interactive_filter_unavailable" {
+                return Err(reason.into());
+            }
             Ok(reason)
         }
         _ = owner.next().fuse() => Err("KWin restarted during magnification".into()),

@@ -1,0 +1,869 @@
+diff --git a/niri-ipc/src/lib.rs b/niri-ipc/src/lib.rs
+index 0aa3cb4..deac161 100644
+--- a/niri-ipc/src/lib.rs
++++ b/niri-ipc/src/lib.rs
+@@ -119,6 +119,30 @@ pub enum Request {
+     OverviewState,
+     /// Request information about screencasts.
+     Casts,
++    /// Check whether this compositor supports PicaLens presentation.
++    PicaLensVersion,
++    /// Present the window while the owning IPC connection and its focus persist.
++    PicaLensStart {
++        /// ID of the window to present, or none to use the compositor's window picker.
++        id: Option<u64>,
++        /// Filter applied to the interactive presentation.
++        #[serde(default)]
++        filter: PicaLensFilter,
++    },
++}
++
++/// Filter for the compositor's interactive PicaLens presentation.
++#[derive(Default, Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
++#[cfg_attr(feature = "json-schema", derive(schemars::JsonSchema))]
++#[serde(rename_all = "lowercase")]
++pub enum PicaLensFilter {
++    /// Bilinear scaling.
++    #[default]
++    Linear,
++    /// FSR 1 EASU and RCAS.
++    Fsr,
++    /// Snapdragon Game Super Resolution.
++    Sgsr,
+ }
+ 
+ /// Reply from niri to client.
+@@ -165,6 +189,10 @@ pub enum Response {
+     OverviewState(Overview),
+     /// Information about screencasts.
+     Casts(Vec<Cast>),
++    /// Version of the PicaLens presentation IPC.
++    PicaLensVersion(u32),
++    /// The user cancelled picking a window.
++    PicaLensCancelled,
+ }
+ 
+ /// Overview information.
+diff --git a/src/input/mod.rs b/src/input/mod.rs
+index f1ad493..4877711 100644
+--- a/src/input/mod.rs
++++ b/src/input/mod.rs
+@@ -492,6 +492,10 @@ impl State {
+                 }
+ 
+                 if pressed && raw == Some(Keysym::Escape) {
++                    if this.niri.popup_grab.is_none() && this.stop_picalens() {
++                        this.niri.suppressed_keys.insert(key_code);
++                        return FilterResult::Intercept(None);
++                    }
+                     // Cancel certain grabs on Escape.
+                     let pointer = this.niri.seat.get_pointer().unwrap();
+                     if pointer
+diff --git a/src/ipc/server.rs b/src/ipc/server.rs
+index db71da6..1baba8c 100644
+--- a/src/ipc/server.rs
++++ b/src/ipc/server.rs
+@@ -35,6 +35,7 @@ use crate::input::pick_window_grab::PickWindowGrab;
+ use crate::layout::workspace::WorkspaceId;
+ use crate::niri::State;
+ use crate::utils::{version, with_toplevel_role};
++use crate::window::mapped::MappedId;
+ use crate::window::Mapped;
+ 
+ // If an event stream client fails to read events fast enough that we accumulate more than this
+@@ -205,6 +206,75 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
+         let request = serde_json::from_slice(&buf)
+             .context("error parsing request")
+             .map_err(|err| err.to_string());
++        if let Ok(Request::PicaLensStart { id, filter }) = request {
++            let id = if let Some(id) = id {
++                Some(id)
++            } else {
++                let (picked_tx, picked_rx) = async_channel::bounded(1);
++                let owner = picked_tx.clone();
++                ctx.event_loop.insert_idle(move |state| {
++                    if state.picalens_available() && state.niri.pick_window.is_none() {
++                        pick_window(state, picked_tx);
++                    } else {
++                        let _ = picked_tx.try_send(None);
++                    }
++                });
++                let mut byte = [0];
++                select_biased! {
++                    _ = read.read(&mut byte).fuse() => {
++                        ctx.event_loop.insert_idle(move |state| {
++                            if state.niri.pick_window.as_ref().is_some_and(|pick| pick.same_channel(&owner)) {
++                                let pointer = state.niri.seat.get_pointer().unwrap();
++                                let time = crate::utils::get_monotonic_time().as_millis() as u32;
++                                pointer.unset_grab(state, SERIAL_COUNTER.next_serial(), time);
++                            }
++                        });
++                        return Ok(());
++                    },
++                    id = picked_rx.recv().fuse() => id.ok().flatten().map(MappedId::get),
++                }
++            };
++            let Some(id) = id else {
++                let mut reply = serde_json::to_vec(&Reply::Ok(Response::PicaLensCancelled))?;
++                reply.push(b'\n');
++                return write
++                    .write_all(&reply)
++                    .await
++                    .context("writing selection reply");
++            };
++            let (finished_tx, finished_rx) = async_channel::bounded(1);
++            let (result_tx, result_rx) = async_channel::bounded(1);
++            let owner = finished_tx.clone();
++            ctx.event_loop.insert_idle(move |state| {
++                let result = state
++                    .start_picalens(id, filter, finished_tx)
++                    .map(|_| Response::Handled);
++                let _ = result_tx.try_send(result);
++            });
++            let result = result_rx.recv().await.context("starting presentation")?;
++            let active = result.is_ok();
++            let mut reply = serde_json::to_vec(&result).context("formatting presentation reply")?;
++            reply.push(b'\n');
++            let mut wrote = write.write_all(&reply).await;
++            if active {
++                if wrote.is_ok() {
++                    let mut byte = [0];
++                    select_biased! {
++                        result = finished_rx.recv().fuse() => {
++                            if let Ok(Some(error)) = result {
++                                let mut reply = serde_json::to_vec(&Reply::Err(error.into()))?;
++                                reply.push(b'\n');
++                                wrote = write.write_all(&reply).await;
++                            }
++                        },
++                        _ = read.read(&mut byte).fuse() => (),
++                    }
++                }
++                ctx.event_loop
++                    .insert_idle(move |state| state.stop_owned_picalens(&owner));
++            }
++            return wrote.context("writing presentation reply");
++        }
+         let requested_error = matches!(request, Ok(Request::ReturnError));
+         let requested_event_stream = matches!(request, Ok(Request::EventStream));
+ 
+@@ -268,10 +338,30 @@ async fn handle_client(ctx: ClientCtx, stream: Async<'static, UnixStream>) -> an
+     }
+ }
+ 
++fn pick_window(state: &mut State, tx: Sender<Option<MappedId>>) {
++    let pointer = state.niri.seat.get_pointer().unwrap();
++    let start_data = PointerGrabStartData {
++        focus: None,
++        button: 0,
++        location: pointer.current_location(),
++    };
++    let grab = PickWindowGrab::new(start_data);
++    // The grab's ungrab handler cancels any previous pending selection.
++    pointer.set_grab(state, grab, SERIAL_COUNTER.next_serial(), Focus::Clear);
++    state.niri.pick_window = Some(tx);
++    state
++        .niri
++        .cursor_manager
++        .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
++    state.niri.queue_redraw_all();
++}
++
+ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+     let response = match request {
+         Request::ReturnError => return Err(String::from("example compositor error")),
+         Request::Version => Response::Version(version()),
++        Request::PicaLensVersion => Response::PicaLensVersion(2),
++        Request::PicaLensStart { .. } => unreachable!("presentation is bound to the IPC client"),
+         Request::Outputs => {
+             let ipc_outputs = ctx.ipc_outputs.lock().unwrap().clone();
+             let outputs = ipc_outputs.values().cloned().map(|o| (o.name.clone(), o));
+@@ -342,25 +432,8 @@ async fn process(ctx: &ClientCtx, request: Request) -> Reply {
+         }
+         Request::PickWindow => {
+             let (tx, rx) = async_channel::bounded(1);
+-            ctx.event_loop.insert_idle(move |state| {
+-                let pointer = state.niri.seat.get_pointer().unwrap();
+-                let start_data = PointerGrabStartData {
+-                    focus: None,
+-                    button: 0,
+-                    location: pointer.current_location(),
+-                };
+-                let grab = PickWindowGrab::new(start_data);
+-                // The `WindowPickGrab` ungrab handler will cancel the previous ongoing pick, if
+-                // any.
+-                pointer.set_grab(state, grab, SERIAL_COUNTER.next_serial(), Focus::Clear);
+-                state.niri.pick_window = Some(tx);
+-                state
+-                    .niri
+-                    .cursor_manager
+-                    .set_cursor_image(CursorImageStatus::Named(CursorIcon::Crosshair));
+-                // Redraw to update the cursor.
+-                state.niri.queue_redraw_all();
+-            });
++            ctx.event_loop
++                .insert_idle(move |state| pick_window(state, tx));
+             let result = rx.recv().await;
+             let id = result.map_err(|_| String::from("error getting picked window info"))?;
+             let window = id.and_then(|id| {
+diff --git a/src/niri.rs b/src/niri.rs
+index ec40e01..0017f6d 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -18,6 +18,7 @@ use niri_config::{
+     Config, FloatOrInt, Key, Modifiers, OutputName, TrackLayout, WarpMouseToFocusMode,
+     WorkspaceReference, Xkb,
+ };
++use niri_ipc::PicaLensFilter;
+ use smithay::backend::allocator::Fourcc;
+ use smithay::backend::input::Keycode;
+ use smithay::backend::renderer::damage::OutputDamageTracker;
+@@ -153,11 +154,14 @@ use crate::protocols::screencopy::{Screencopy, ScreencopyBuffer, ScreencopyManag
+ use crate::protocols::virtual_pointer::VirtualPointerManagerState;
+ use crate::render_helpers::blur::BlurOptions;
+ use crate::render_helpers::debug::push_opaque_regions;
++use crate::render_helpers::offscreen::{OffscreenBuffer, OffscreenData};
++use crate::render_helpers::picalens::surface_scale;
+ use crate::render_helpers::primary_gpu_texture::PrimaryGpuTextureRenderElement;
++use crate::render_helpers::shaders::Shaders;
+ use crate::render_helpers::renderer::NiriRenderer;
+ use crate::render_helpers::solid_color::{SolidColorBuffer, SolidColorRenderElement};
+ use crate::render_helpers::surface::push_elements_from_surface_tree;
+-use crate::render_helpers::texture::TextureBuffer;
++use crate::render_helpers::texture::{TextureBuffer, TextureRenderElement};
+ use crate::render_helpers::xray::{Xray, XrayPos};
+ use crate::render_helpers::{
+     encompassing_geo, render_to_dmabuf, render_to_encompassing_texture, render_to_shm,
+@@ -191,6 +195,66 @@ const CLEAR_COLOR_LOCKED: [f32; 4] = [0.3, 0.1, 0.1, 1.];
+ // should be ~1.995 seconds.
+ const FRAME_CALLBACK_THROTTLE: Option<Duration> = Some(Duration::from_millis(995));
+ 
++pub(crate) struct PicaLensPresentation {
++    id: MappedId,
++    output: Output,
++    finished: async_channel::Sender<Option<&'static str>>,
++    filter: PicaLensFilter,
++    gpu: Option<PicaLensGpu>,
++}
++
++#[derive(Default)]
++struct PicaLensGpu {
++    source: OffscreenBuffer,
++    visible: RefCell<Option<OffscreenData>>,
++    failed: Cell<bool>,
++}
++
++impl PicaLensGpu {
++    fn render<R: NiriRenderer>(
++        &self,
++        mut ctx: RenderCtx<R>,
++        mapped: &Mapped,
++        destination: Rectangle<f64, Logical>,
++        output_scale: Scale<f64>,
++        filter: PicaLensFilter,
++    ) -> anyhow::Result<(PrimaryGpuTextureRenderElement, OffscreenData)> {
++        let programs = Shaders::get(ctx.renderer)
++            .picalens
++            .ok_or_else(|| anyhow::anyhow!("PicaLens shaders unavailable"))?;
++        let scale = surface_scale(mapped.toplevel().wl_surface())
++            .ok_or_else(|| anyhow::anyhow!("PicaLens source buffer unavailable"))?;
++        let mut ctx = ctx.as_gles();
++        let mut elements = Vec::new();
++        mapped.render(
++            ctx.r(),
++            Point::default(),
++            scale,
++            1.,
++            XrayPos::default(),
++            &mut |element| elements.push(element),
++        );
++        let source = Rectangle::from_size(mapped.size().to_f64()).to_physical_precise_round(scale);
++        let (element, _, mut data) =
++            self.source
++                .render_geometry(ctx.renderer, scale, source, &elements, true)?;
++        let extent = destination.to_physical_precise_round(output_scale).size;
++        let texture = programs.render(ctx.renderer, element.texture(), source.size, extent, filter)?;
++        let buffer =
++            TextureBuffer::from_texture(ctx.renderer, texture, 1., Transform::Normal, Vec::new());
++        let element = TextureRenderElement::from_texture_buffer(
++            buffer,
++            destination.loc,
++            1.,
++            None,
++            Some(destination.size),
++            Kind::Unspecified,
++        );
++        data.id = element.id().clone();
++        Ok((PrimaryGpuTextureRenderElement(element), data))
++    }
++}
++
+ pub struct Niri {
+     pub config: Rc<RefCell<Config>>,
+ 
+@@ -393,6 +457,7 @@ pub struct Niri {
+     pub pending_mru_commit: Option<PendingMruCommit>,
+ 
+     pub pick_window: Option<async_channel::Sender<Option<MappedId>>>,
++    picalens: Option<PicaLensPresentation>,
+     pub pick_color: Option<async_channel::Sender<Option<niri_ipc::PickedColor>>>,
+ 
+     pub debug_draw_opaque_regions: bool,
+@@ -801,6 +866,13 @@ impl State {
+         self.niri.popups.cleanup();
+         self.refresh_popup_grab();
+         self.update_keyboard_focus();
++        if let Some(presentation) = &self.niri.picalens {
++            if self.niri.picalens_geometry(&presentation.output).is_none()
++                || presentation.gpu.as_ref().is_some_and(|gpu| gpu.failed.get())
++            {
++                self.stop_picalens();
++            }
++        }
+ 
+         // Should be called before refresh_layout() because that one will refresh other window
+         // states and then send a pending configure.
+@@ -989,6 +1061,78 @@ impl State {
+         self.niri.queue_redraw_all();
+     }
+ 
++    pub(crate) fn picalens_available(&self) -> bool {
++        self.niri.picalens.is_none()
++            && !self.niri.is_locked()
++            && !self.niri.layout.is_overview_open()
++            && !self.niri.screenshot_ui.is_open()
++            && !self.niri.window_mru_ui.is_open()
++            && !self.niri.exit_confirm_dialog.is_open()
++            && !self.niri.seat.get_pointer().unwrap().is_grabbed()
++    }
++
++    pub(crate) fn start_picalens(
++        &mut self,
++        id: u64,
++        filter: PicaLensFilter,
++        finished: async_channel::Sender<Option<&'static str>>,
++    ) -> Result<(), String> {
++        if !self.picalens_available() {
++            return Err("picalens_busy".into());
++        }
++        let (id, window) = self
++            .niri
++            .layout
++            .windows()
++            .find(|(_, window)| window.id().get() == id)
++            .map(|(_, mapped)| (mapped.id(), mapped.window.clone()))
++            .ok_or("no_active_window")?;
++        self.niri.layout.activate_window(&window);
++        self.update_keyboard_focus();
++        let output = self
++            .niri
++            .layout
++            .active_output()
++            .cloned()
++            .ok_or("no_active_window")?;
++        self.niri.picalens = Some(PicaLensPresentation {
++            id,
++            output: output.clone(),
++            finished,
++            filter,
++            gpu: (filter != PicaLensFilter::Linear).then(PicaLensGpu::default),
++        });
++        if self.niri.picalens_geometry(&output).is_none() {
++            self.stop_picalens();
++            return Err("no_active_window".into());
++        }
++        self.niri.queue_redraw_all();
++        self.refresh_pointer_contents();
++        Ok(())
++    }
++
++    pub(crate) fn stop_picalens(&mut self) -> bool {
++        let Some(presentation) = self.niri.picalens.take() else {
++            return false;
++        };
++        let error = presentation.gpu.as_ref().is_some_and(|gpu| gpu.failed.get())
++            .then_some("interactive_filter_unavailable");
++        let _ = presentation.finished.try_send(error);
++        self.niri.queue_redraw_all();
++        true
++    }
++
++    pub(crate) fn stop_owned_picalens(&mut self, owner: &async_channel::Sender<Option<&'static str>>) {
++        if self
++            .niri
++            .picalens
++            .as_ref()
++            .is_some_and(|p| p.finished.same_channel(owner))
++        {
++            self.stop_picalens();
++        }
++    }
++
+     pub fn confirm_mru(&mut self) {
+         if let Some(window) = self.niri.close_mru(MruCloseRequest::Confirm) {
+             self.focus_window(&window);
+@@ -2604,6 +2748,7 @@ impl Niri {
+             pending_mru_commit: None,
+ 
+             pick_window: None,
++            picalens: None,
+             pick_color: None,
+ 
+             debug_draw_opaque_regions: false,
+@@ -3231,6 +3376,55 @@ impl Niri {
+         self.workspace_under(extended_bounds, pos)
+     }
+ 
++    fn picalens_geometry(
++        &self,
++        output: &Output,
++    ) -> Option<(&Mapped, Rectangle<f64, Logical>, f64)> {
++        let presentation = self.picalens.as_ref()?;
++        if &presentation.output != output
++            || self.is_locked()
++            || self.exit_confirm_dialog.is_open()
++            || self.screenshot_ui.is_open()
++            || self.window_mru_ui.is_open()
++            || self.layout.is_overview_open()
++        {
++            return None;
++        }
++        let (mapped, focused_output) = self.layout.focus_with_output()?;
++        if mapped.id() != presentation.id || focused_output != output {
++            return None;
++        }
++        if !matches!(&self.keyboard_focus, KeyboardFocus::Layout { surface: Some(surface) } if surface == mapped.toplevel().wl_surface())
++        {
++            return None;
++        }
++        let available = self.global_space.output_geometry(output)?.size.to_f64();
++        let size = mapped.size().to_f64();
++        if size.w <= 0. || size.h <= 0. {
++            return None;
++        }
++        let zoom = (available.w / size.w).min(available.h / size.h);
++        let destination = size.upscale(zoom);
++        let offset = Point::from((
++            (available.w - destination.w) / 2.,
++            (available.h - destination.h) / 2.,
++        ));
++        Some((mapped, Rectangle::new(offset, destination), zoom))
++    }
++
++    fn picalens_input_geometry(
++        &self,
++        output: &Output,
++    ) -> Option<(&Mapped, Rectangle<f64, Logical>, f64)> {
++        let geometry = self.picalens_geometry(output)?;
++        if let Some(gpu) = self.picalens.as_ref()?.gpu.as_ref() {
++            if gpu.failed.get() || gpu.visible.borrow().is_none() {
++                return None;
++            }
++        }
++        Some(geometry)
++    }
++
+     /// Returns the window under the position to be activated.
+     ///
+     /// The cursor may be inside the window's activation region, but not within the window's input
+@@ -3246,6 +3440,10 @@ impl Niri {
+ 
+         let (output, pos_within_output) = self.output_under(pos)?;
+ 
++        if let Some((window, destination, _)) = self.picalens_input_geometry(output) {
++            return destination.contains(pos_within_output).then_some(window);
++        }
++
+         if self.is_sticky_obscured_under(output, pos_within_output) {
+             return None;
+         }
+@@ -3323,6 +3521,26 @@ impl Niri {
+             return rv;
+         }
+ 
++        if let Some((mapped, destination, zoom)) = self.picalens_input_geometry(output) {
++            if destination.contains(pos_within_output) {
++                let window = &mapped.window;
++                let source = (pos_within_output - destination.loc).downscale(zoom)
++                    + window.geometry().loc.to_f64();
++                if let Some((surface, surface_loc)) =
++                    window.surface_under(source, WindowSurfaceType::ALL)
++                {
++                    rv.surface = Some((surface, pos - (source - surface_loc.to_f64())));
++                    rv.window = Some((
++                        window.clone(),
++                        HitType::Input {
++                            win_pos: pos_within_output - source,
++                        },
++                    ));
++                }
++            }
++            return rv;
++        }
++
+         let layers = layer_map_for_output(output);
+         let layer_surface_under = |layer, popup| {
+             layers
+@@ -4277,6 +4495,47 @@ impl Niri {
+             return;
+         }
+ 
++        if let Some((mapped, destination, zoom)) = self.picalens_geometry(output) {
++            let presentation = self.picalens.as_ref().unwrap();
++            if let Some(gpu) = &presentation.gpu {
++                match gpu.render(ctx.r(), mapped, destination, output_scale, presentation.filter) {
++                    Ok((element, data)) => {
++                        if ctx.target == RenderTarget::Output {
++                            if gpu.visible.borrow().is_none() {
++                                info!(filter = ?presentation.filter, "PicaLens interactive shader");
++                            }
++                            gpu.visible.replace(Some(data));
++                        }
++                        push(element.into());
++                        push(backdrop);
++                        return;
++                    }
++                    Err(error) => {
++                        if ctx.target == RenderTarget::Output && !gpu.failed.replace(true) {
++                            warn!("PicaLens filter failed: {error:#}");
++                        }
++                    }
++                }
++            } else {
++                mapped.render(
++                    ctx.r(),
++                    Point::default(),
++                    output_scale,
++                    1.,
++                    XrayPos::default(),
++                    &mut |element| {
++                        if let Some(element) =
++                            scale_relocate_crop(element, output_scale, zoom, destination)
++                        {
++                            push(OutputRenderElements::PicaLens(element));
++                        }
++                    },
++                );
++                push(backdrop);
++                return;
++            }
++        }
++
+         // Draw the hotkey overlay on top.
+         if let Some(element) = self.hotkey_overlay.render(ctx.renderer, output) {
+             push(element.into());
+@@ -4792,8 +5051,12 @@ impl Niri {
+ 
+         for mapped in self.layout.windows_for_output(output) {
+             let win = &mapped.window;
++            let gpu = self.picalens.as_ref()
++                .filter(|presentation| presentation.id == mapped.id() && &presentation.output == output)
++                .and_then(|presentation| presentation.gpu.as_ref())
++                .map(|gpu| gpu.visible.borrow());
+             let offscreen_data = mapped.offscreen_data();
+-            let offscreen_data = offscreen_data.as_ref();
++            let offscreen_data = gpu.as_deref().and_then(Option::as_ref).or(offscreen_data.as_ref());
+ 
+             win.with_surfaces(|surface, states| {
+                 let primary_scanout_output = states
+@@ -6510,6 +6773,7 @@ niri_render_elements! {
+     OutputRenderElements<R> => {
+         Monitor = MonitorRenderElement<R>,
+         RescaledTile = RescaleRenderElement<TileRenderElement<R>>,
++        PicaLens = CropRenderElement<RelocateRenderElement<RescaleRenderElement<LayoutElementRenderElement<R>>>>,
+         LayerSurface = LayerSurfaceRenderElement<R>,
+         RelocatedLayerSurface = CropRenderElement<RelocateRenderElement<RescaleRenderElement<
+             LayerSurfaceRenderElement<R>
+diff --git a/src/render_helpers/mod.rs b/src/render_helpers/mod.rs
+index 474437a..18c174c 100644
+--- a/src/render_helpers/mod.rs
++++ b/src/render_helpers/mod.rs
+@@ -37,6 +37,7 @@ pub mod framebuffer_effect;
+ pub mod gradient_fade_texture;
+ pub mod memory;
+ pub mod offscreen;
++pub mod picalens;
+ pub mod primary_gpu_texture;
+ pub mod render_elements;
+ pub mod renderer;
+diff --git a/src/render_helpers/offscreen.rs b/src/render_helpers/offscreen.rs
+index 2f624b1..e237a38 100644
+--- a/src/render_helpers/offscreen.rs
++++ b/src/render_helpers/offscreen.rs
+@@ -78,6 +78,19 @@ impl OffscreenBuffer {
+         let _span = tracy_client::span!("OffscreenBuffer::render");
+ 
+         let geo = encompassing_geo(scale, elements.iter());
++        self.render_geometry(renderer, scale, geo, elements, false)
++    }
++
++    pub fn render_geometry(
++        &self,
++        renderer: &mut GlesRenderer,
++        scale: Scale<f64>,
++        geo: Rectangle<i32, Physical>,
++        elements: &[impl RenderElement<GlesRenderer>],
++        exact_size: bool,
++    ) -> anyhow::Result<(OffscreenRenderElement, SyncPoint, OffscreenData)> {
++        let _span = tracy_client::span!("OffscreenBuffer::render_geometry");
++
+         let elements = Vec::from_iter(elements.iter().map(|ele| {
+             RelocateRenderElement::from_element(ele, geo.loc.upscale(-1), Relocate::Relative)
+         }));
+@@ -103,9 +116,11 @@ impl OffscreenBuffer {
+         }) = inner.as_mut()
+         {
+             let old_size = texture.size();
+-            if old_size.w < src_size.w || old_size.h < src_size.h {
++            if old_size.w < src_size.w || old_size.h < src_size.h
++                || (exact_size && old_size != src_size)
++            {
+                 size_string = format!(
+-                    "size increased from {} × {} to {} × {}",
++                    "texture resize from {} × {} to {} × {}",
+                     old_size.w, old_size.h, src_size.w, src_size.h
+                 );
+                 reason = &size_string;
+diff --git a/src/render_helpers/shaders/mod.rs b/src/render_helpers/shaders/mod.rs
+index 7be9b15..5e40e22 100644
+--- a/src/render_helpers/shaders/mod.rs
++++ b/src/render_helpers/shaders/mod.rs
+@@ -9,6 +9,7 @@ use smithay::backend::renderer::gles::{
+ use super::renderer::NiriRenderer;
+ use super::shader_element::ShaderProgram;
+ use crate::render_helpers::blur::BlurProgram;
++use crate::render_helpers::picalens::UpscalePrograms;
+ 
+ pub struct Shaders {
+     pub border: Option<ShaderProgram>,
+@@ -18,6 +19,7 @@ pub struct Shaders {
+     pub resize: Option<ShaderProgram>,
+     pub gradient_fade: Option<GlesTexProgram>,
+     pub blur: Option<BlurProgram>,
++    pub picalens: Option<UpscalePrograms>,
+     pub custom_resize: RefCell<Option<ShaderProgram>>,
+     pub custom_close: RefCell<Option<ShaderProgram>>,
+     pub custom_open: RefCell<Option<ShaderProgram>>,
+@@ -156,6 +158,7 @@ impl Shaders {
+             resize,
+             gradient_fade,
+             blur,
++            picalens: UpscalePrograms::compile(renderer).ok(),
+             custom_resize: RefCell::new(None),
+             custom_close: RefCell::new(None),
+             custom_open: RefCell::new(None),
+diff --git a/src/render_helpers/picalens.rs b/src/render_helpers/picalens.rs
+new file mode 100644
+index 0000000..b8d47f3
+--- /dev/null
++++ b/src/render_helpers/picalens.rs
+@@ -0,0 +1,209 @@
++use anyhow::{ensure, Context as _};
++use niri_ipc::PicaLensFilter;
++use smithay::backend::allocator::Fourcc;
++use smithay::backend::renderer::gles::{ffi, link_program, GlesError, GlesRenderer, GlesTexture};
++use smithay::backend::renderer::utils::with_renderer_surface_state;
++use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
++use smithay::utils::{Physical, Scale, Size};
++
++use super::create_texture;
++
++const VERTEX: &str = r#"#version 310 es
++void main() {
++    vec2 corner = vec2((gl_VertexID << 1) & 2, gl_VertexID & 2);
++    gl_Position = vec4(corner * 2.0 - 1.0, 0.0, 1.0);
++}"#;
++const HEADER: &str = "#version 310 es\nprecision highp float;\nprecision highp int;\n                      uniform sampler2D inputImage;\nuniform vec2 outputSize;\nout vec4 outputColor;\n";
++
++#[derive(Clone, Copy)]
++pub struct UpscalePrograms {
++    easu: Option<Program>,
++    rcas: Option<Program>,
++    sgsr: Option<Program>,
++}
++
++#[derive(Clone, Copy)]
++struct Program {
++    id: u32,
++    sampler: i32,
++    size: i32,
++}
++
++impl Program {
++    fn compile(gl: &ffi::Gles2, defines: &str, algorithm: &str, pass: &str) -> Option<Self> {
++        match unsafe { link_program(gl, VERTEX, &format!("{HEADER}{defines}{algorithm}{pass}")) } {
++            Ok(id) => Some(Self {
++                id,
++                sampler: unsafe { gl.GetUniformLocation(id, c"inputImage".as_ptr()) },
++                size: unsafe { gl.GetUniformLocation(id, c"outputSize".as_ptr()) },
++            }),
++            Err(err) => {
++                warn!("PicaLens shader compilation failed: {err}");
++                None
++            }
++        }
++    }
++}
++
++impl UpscalePrograms {
++    pub fn compile(renderer: &mut GlesRenderer) -> Result<Self, GlesError> {
++        renderer.with_context(|gl| {
++            let fsr = include_str!("picalens-shaders/fsr1.glsl");
++            Self {
++                easu: Program::compile(
++                    gl,
++                    "#define FSR_EASU_F\n",
++                    fsr,
++                    include_str!("picalens-shaders/easu-pass.glsl"),
++                ),
++                rcas: Program::compile(
++                    gl,
++                    "#define FSR_RCAS_F\n",
++                    fsr,
++                    include_str!("picalens-shaders/rcas-pass.glsl"),
++                ),
++                sgsr: Program::compile(
++                    gl,
++                    "",
++                    include_str!("picalens-shaders/sgsr1.glsl"),
++                    include_str!("picalens-shaders/sgsr-pass.glsl"),
++                ),
++            }
++        })
++    }
++
++    pub fn render(
++        self,
++        renderer: &mut GlesRenderer,
++        source: &GlesTexture,
++        source_size: Size<i32, Physical>,
++        destination: Size<i32, Physical>,
++        filter: PicaLensFilter,
++    ) -> anyhow::Result<GlesTexture> {
++        let message = "PicaLens filter is unavailable";
++        let (upscale, sharpen) = match filter {
++            PicaLensFilter::Fsr => (
++                self.easu.context(message)?,
++                Some(self.rcas.context(message)?),
++            ),
++            PicaLensFilter::Sgsr => (self.sgsr.context(message)?, None),
++            PicaLensFilter::Linear => {
++                anyhow::bail!("PicaLens linear filter does not require a shader")
++            }
++        };
++
++        let mut limit = 0;
++        renderer.with_context(|gl| unsafe { gl.GetIntegerv(ffi::MAX_TEXTURE_SIZE, &mut limit) })?;
++        let w = f64::from(destination.w);
++        let h = f64::from(destination.h);
++        ensure!(
++            w > 0. && h > 0. && source_size.w <= limit && source_size.h <= limit,
++            "invalid filter geometry"
++        );
++        let scale = 1_f64
++            .min(2. * f64::from(source_size.w) / w)
++            .min(2. * f64::from(source_size.h) / h)
++            .min((3840. * 2160. / (w * h)).sqrt())
++            .min(f64::from(limit) / w.max(h));
++        let extent = Size::from(((w * scale).floor() as i32, (h * scale).floor() as i32));
++        ensure!(
++            extent.w >= source_size.w && extent.h >= source_size.h && extent != source_size,
++            "PicaLens GPU filters require an enlarged destination"
++        );
++
++        let output = create_texture(renderer, extent, Fourcc::Abgr8888)?;
++        let intermediate = if sharpen.is_some() {
++            Some(create_texture(renderer, extent, Fourcc::Abgr8888)?)
++        } else {
++            None
++        };
++
++        renderer.with_context(|gl| unsafe {
++            let mut fbo = 0;
++            let mut draw_fbo = 0;
++            let mut viewport = [0; 4];
++            let mut program = 0;
++            let mut active_texture = 0;
++            let mut texture = 0;
++            let mut sampler = 0;
++            gl.GetIntegerv(ffi::DRAW_FRAMEBUFFER_BINDING, &mut draw_fbo);
++            gl.GetIntegerv(ffi::VIEWPORT, viewport.as_mut_ptr());
++            gl.GetIntegerv(ffi::CURRENT_PROGRAM, &mut program);
++            gl.GetIntegerv(ffi::ACTIVE_TEXTURE, &mut active_texture);
++            gl.ActiveTexture(ffi::TEXTURE0);
++            gl.GetIntegerv(ffi::TEXTURE_BINDING_2D, &mut texture);
++            gl.GetIntegerv(ffi::SAMPLER_BINDING, &mut sampler);
++            let blend = gl.IsEnabled(ffi::BLEND) != 0;
++            let scissor = gl.IsEnabled(ffi::SCISSOR_TEST) != 0;
++            gl.Disable(ffi::BLEND);
++            gl.Disable(ffi::SCISSOR_TEST);
++            gl.BindSampler(0, 0);
++            gl.GenFramebuffers(1, &mut fbo);
++            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, fbo);
++            gl.Viewport(0, 0, extent.w, extent.h);
++
++            let pass = |program: Program,
++                        input: &GlesTexture,
++                        target: &GlesTexture|
++             -> anyhow::Result<()> {
++                gl.FramebufferTexture2D(
++                    ffi::DRAW_FRAMEBUFFER,
++                    ffi::COLOR_ATTACHMENT0,
++                    ffi::TEXTURE_2D,
++                    target.tex_id(),
++                    0,
++                );
++                ensure!(
++                    gl.CheckFramebufferStatus(ffi::DRAW_FRAMEBUFFER) == ffi::FRAMEBUFFER_COMPLETE,
++                    "incomplete PicaLens shader framebuffer"
++                );
++                gl.UseProgram(program.id);
++                gl.Uniform1i(program.sampler, 0);
++                gl.Uniform2f(program.size, extent.w as f32, extent.h as f32);
++                gl.BindTexture(ffi::TEXTURE_2D, input.tex_id());
++                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MIN_FILTER, ffi::LINEAR as i32);
++                gl.TexParameteri(ffi::TEXTURE_2D, ffi::TEXTURE_MAG_FILTER, ffi::LINEAR as i32);
++                gl.DrawArrays(ffi::TRIANGLES, 0, 3);
++                ensure!(
++                    gl.GetError() == ffi::NO_ERROR,
++                    "PicaLens shader draw failed"
++                );
++                Ok(())
++            };
++            let result = if let Some((sharpen, intermediate)) = sharpen.zip(intermediate.as_ref()) {
++                pass(upscale, source, intermediate)
++                    .and_then(|()| pass(sharpen, intermediate, &output))
++            } else {
++                pass(upscale, source, &output)
++            };
++
++            if blend {
++                gl.Enable(ffi::BLEND);
++            }
++            if scissor {
++                gl.Enable(ffi::SCISSOR_TEST);
++            }
++            gl.BindSampler(0, sampler as u32);
++            gl.BindTexture(ffi::TEXTURE_2D, texture as u32);
++            gl.ActiveTexture(active_texture as u32);
++            gl.UseProgram(program as u32);
++            gl.Viewport(viewport[0], viewport[1], viewport[2], viewport[3]);
++            gl.BindFramebuffer(ffi::DRAW_FRAMEBUFFER, draw_fbo as u32);
++            gl.DeleteFramebuffers(1, &fbo);
++            result
++        })??;
++        Ok(output)
++    }
++}
++
++/// Source texture density after the compositor's viewport crop and scale.
++pub fn surface_scale(surface: &WlSurface) -> Option<Scale<f64>> {
++    with_renderer_surface_state(surface, |state| {
++        let view = state.view()?;
++        let scale = f64::from(state.buffer_scale());
++        let x = scale * view.src.size.w / f64::from(view.dst.w);
++        let y = scale * view.src.size.h / f64::from(view.dst.h);
++        let scale = x.min(y);
++        (scale.is_finite() && scale > 0.).then(|| Scale::from(scale))
++    })?
++}

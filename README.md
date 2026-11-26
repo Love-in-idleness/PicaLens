@@ -16,19 +16,25 @@ sudo apt install ./picalens_0.1.0-1ubuntu26.10_amd64.deb
 
 ## 使用
 
-打开 `picalens`，在「放大」页选择预设，然后点击「选择窗口」。可以在「缩放预设」页编辑或复制设置。默认等比适应，另有裁剪铺满、拉伸和整数倍缩放。窗口化、整数倍、最近邻和超分滤镜使用只读预览。只读预览中按 F11 切换窗口和全屏，按 F12 保存截图，按 Esc 结束。
+打开 `picalens`，在「放大」页选择预设，然后点击「选择窗口」。可以在「缩放预设」页编辑或复制设置。默认等比适应，另有裁剪铺满、拉伸和整数倍缩放。窗口化、整数倍和最近邻使用只读预览。只读预览中按 F11 切换窗口和全屏，按 F12 保存截图，按 Esc 结束。
 
 Lanczos 3 按预览的物理像素尺寸重采样，适合文字和普通画面。Scale2x 先重建像素画的斜边，再用最近邻缩放到预览尺寸。两个滤镜在后台线程处理最新帧。超过中间图像上限的 Scale2x 使用最近邻。
 
-预览滤镜 **FSR 1** 采用 EASU 放大和 RCAS 锐化两个阶段，**SGSR** 采用单阶段的空间放大。两者复用 Gamescope 的 SDR 着色算法，使用 OpenGL 4.0。着色器最多放大 2 倍每边，中间图像上限为 3840×2160 等量像素。设备无法运行着色器时，预览会提示并使用线性缩放。 [Gamescope 着色器](https://github.com/ValveSoftware/gamescope/tree/7d957c518081c27e95b0f2d3501237abc62bf4f5/src/shaders)
+**FSR 1** 采用 EASU 放大和 RCAS 锐化两个阶段，**SGSR** 采用单阶段的空间放大。两者复用 Gamescope 的 SDR 着色算法。着色器最多放大 2 倍每边，中间图像上限为 3840×2160 等量像素。选择交互全屏时，软件会检查后端和放大尺寸是否支持所选滤镜，无法运行时会给出提示。 [Gamescope 着色器](https://github.com/ValveSoftware/gamescope/tree/7d957c518081c27e95b0f2d3501237abc62bf4f5/src/shaders)
 
-Plasma 6 会话中，兼容的 KWin 后台支持交互全屏，可以点击、滚动和操作键盘。GNOME 和 Plasma 的「设置」页可修改放大快捷键。使用交互全屏预设时，快捷键或 `picalens toggle` 直接放大当前活动窗口，再按一次恢复。要手动指定窗口或使用只读预览，请从界面点击「选择窗口」。 [Plasma 构建与验收](docs/kwin-experiment.md)
+Plasma 6 会话中，兼容的 KWin 后台支持交互全屏，可以点击、滚动和操作键盘。使用 OpenGL 合成时，全屏预设可以同时启用 FSR 1 或 SGSR，原生 Wayland 和 XWayland 窗口均可操作。GNOME 和 Plasma 的「设置」页可修改放大快捷键。在 Plasma 使用交互全屏预设时，快捷键或 `picalens toggle` 直接放大当前活动窗口，再按一次恢复。要手动指定窗口或使用只读预览，请从界面点击「选择窗口」。 [Plasma 构建与验收](docs/kwin-experiment.md)
 
 ### niri 和 Hyprland
 
-两者使用 ScreenCast Portal 选窗和 PipeWire 单窗流，提供只读放大。niri 会话使用 `xdg-desktop-portal-gnome`，Hyprland 会话使用 `xdg-desktop-portal-hyprland`。原生 Wayland 和 XWayland 窗口共用系统选窗器，取帧取决于合成器提供的来源和本机图形驱动。 [niri 采集文档](https://niri-wm.github.io/niri/Screencasting.html) · [Hyprland Portal 文档](https://wiki.hypr.land/hypr-ecosystem/user/xdg-desktop-portal-hyprland/)
+niri 26.04 和 Hyprland 0.53.3 的 PicaLens 后端支持等比全屏，滤镜可选线性、FSR 1 和 SGSR。两种 GPU 滤镜都在隔离会话中通过了原生 Wayland 和 XWayland 的原窗口输入测试。 [niri 后端](docs/niri-experiment.md) · [Hyprland 后端](docs/hyprland-experiment.md)
 
-`picalens toggle` 打开选窗器，再按一次结束预览。niri 的 `binds` 中可添加 `Mod+F8 { spawn "picalens" "toggle"; }`。使用 Hyprlang 配置的 Hyprland 可添加 `bind = SUPER, F8, exec, picalens toggle`，使用 Lua 配置的版本可将同一命令绑定到执行调度器。
+只读预览使用 ScreenCast Portal 选窗和 PipeWire 单窗流。niri 会话使用 `xdg-desktop-portal-gnome`，Hyprland 会话使用 `xdg-desktop-portal-hyprland`。Hyprland 旧版选窗器若显示多个来源标签，请切换到 **Window** 再选择应用。 [验收记录](docs/verification.md#niri-与-hyprland-单窗放大) · [niri 采集文档](https://niri-wm.github.io/niri/Screencasting.html) · [Hyprland Portal 文档](https://wiki.hypr.land/hypr-ecosystem/user/xdg-desktop-portal-hyprland/)
+
+`picalens toggle` 打开选窗器，再按一次结束放大。niri 的 `binds` 中可添加 `Mod+F8 { spawn "picalens" "toggle"; }`。使用 Hyprlang 配置的 Hyprland 可添加 `bind = SUPER, F8, exec, picalens toggle`，使用 Lua 配置的版本可将同一命令绑定到执行调度器。
+
+### DDE Wayland（Treeland）
+
+DDE、Deepin 和 Treeland 会话使用同一个「选择窗口」入口和 `picalens toggle` 命令，预览为只读。桌面需启用提供 Window 来源的 `xdg-desktop-portal-dde` 与 PipeWire。构建后可运行 `target/debug/picalens-probe --desktop-only`，检查 `ScreenCast AvailableSourceTypes` 是否包含窗口位 `0x2`。目前已接入 PicaLens，实际 Treeland 会话的取帧和 XWayland 选窗仍待验收。 [DDE Portal 单窗流实现](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/7f1721594b424161a90afe4ecdc936f6fd8767c0/src/wayland/treelandintegration.cpp#L112)
 
 ### GNOME
 
@@ -75,4 +81,4 @@ target/debug/picalens-test-window --xwayland  # XWayland 源窗
 target/debug/picalens-probe                # Portal 捕获探针
 ```
 
-KWin 6.3.6 的 QPainter 测试会话已覆盖两种源窗在 100% 和 150% 缩放下的点击、滚轮和按键。DRM/OpenGL 与实机性能仍待验收。GNOME 50.1 的 Portal 只读捕获已验证。 [验证记录](docs/verification.md)
+KWin 6.3.6 的 QPainter 测试会话已覆盖两种源窗在 100% 和 150% 缩放下的线性交互。KWin 6.7.5 的 DRM/OpenGL 虚拟机已覆盖两种源窗的 FSR 1 与 SGSR 交互。GNOME 50.1 的 Portal 只读捕获已验证。GPU 滤镜的物理显卡性能仍待验证。 [验证记录](docs/verification.md)

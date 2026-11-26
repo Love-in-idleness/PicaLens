@@ -17,7 +17,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_AUTOMOC ON)
 list(APPEND CMAKE_AUTOMOC_MACRO_NAMES KWIN_EFFECT_FACTORY_SUPPORTED_ENABLED)
 
-add_library(picalens MODULE effect.cpp presentation.cpp inputfilter.cpp)
+add_library(picalens MODULE effect.cpp presentation.cpp gpu_presentation.cpp inputfilter.cpp)
+qt_add_resources(picalens shaders
+    PREFIX "/picalens/shaders"
+    BASE "../src/shaders"
+    FILES
+        ../src/shaders/fsr1.glsl
+        ../src/shaders/sgsr1.glsl
+        ../src/shaders/easu-pass.glsl
+        ../src/shaders/rcas-pass.glsl
+        ../src/shaders/sgsr-pass.glsl)
 set_target_properties(picalens PROPERTIES PREFIX "")
 target_link_libraries(picalens PRIVATE KWin::kwin Qt6::DBus Qt6::Widgets)
 if(KWin_VERSION VERSION_EQUAL "6.7.5")

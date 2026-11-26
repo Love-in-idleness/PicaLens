@@ -99,3 +99,16 @@ target/debug/picalens-test-window --sentinel
 在同一 KWin 6.3.6 环境中，从桌面启动器后点击 **Choose Window…**，也从命令 `picalens toggle` 直接选窗。首次选窗时应用自动加载后台。原生 Wayland 与 XWayland 源窗在 100% 缩放下各依序收到 1–9 的点击，以及滚轮和按键。黑边的点击和滚轮未送达源窗。两类源窗在 150% 下又各复测中央点击、滚轮和按键。
 
 Esc 和第二次 `toggle` 均可取消选窗。关闭源窗或强制结束 PicaLens 后，会话结束并释放输入，可再次选窗。GNOME 50.1 实测通过同一命令启动 Portal 只读全屏预览，预览持续出帧，点击未送到源窗，Esc 退出。统一入口的复测记录位于 `/workspace/scratch/picalens-lab/evidence-unified/`。
+
+### FSR 1 与 SGSR 交互验收
+
+在 Ubuntu 26.10 的 KWin 6.7.5 虚拟机中，使用 DRM、VirGL OpenGL 4.3 合成和 1280×768 输出，缩放为 100%。在 PicaLens 选择全屏、等比适应与所需滤镜，聚焦源窗后执行 `picalens toggle`。日志中的 `first frame drawn filter=` 会记录实际绘制的滤镜。只有第一个滤镜画面绘制成功后，后台才启用鼠标坐标换算。
+
+| 滤镜 | 源窗 | 点击、滚轮、按键 | 黑边 |
+| --- | --- | --- | --- |
+| FSR 1 | 原生 Wayland | 1–9 依序命中，滚轮和 A 键到达源窗 | 点击和滚轮均未送达测试窗 |
+| SGSR | 原生 Wayland | 1–9 依序命中，滚轮和 A 键到达源窗 | 点击和滚轮均未送达测试窗 |
+| FSR 1 | XWayland | 1–9 依序命中，滚轮和 A 键到达源窗 | 点击和滚轮均未送达测试窗 |
+| SGSR | XWayland | 1–9 依序命中，滚轮和 A 键到达源窗 | 点击和滚轮均未送达测试窗 |
+
+两种源窗的固定九宫格区域均做了截图逐像素比较。FSR 1 和 SGSR 的输出彼此不同，也都与线性滤镜不同。四组均能再次执行 `toggle` 恢复原窗。另在 1920×1080、150% 缩放下复测了 XWayland 与 SGSR 的同一组输入。物理显卡性能和剩余的 150% 组合仍待验证。

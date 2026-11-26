@@ -16,6 +16,7 @@ use crate::{
     gpu::GpuUpscaler,
     kwin,
     locale::Locale,
+    native,
     preview::{self, StopSender},
     session::{self, Result, Stop, Target},
     settings::{DEFAULT_ID, Filter, Language, Layout, Presentation, Preset, Settings, Theme},
@@ -582,12 +583,16 @@ impl View {
 
     fn show_mode(&self) {
         let preset = self.active_preset();
-        let key = if portal_required(&preset) {
+        let key = if interactive_gpu(&preset) {
+            "backend_gpu_auto"
+        } else if portal_required(&preset) {
             "backend_portal"
         } else if is_plasma() {
             "backend_auto"
         } else if is_gnome() {
             "backend_gnome_auto"
+        } else if preset.layout == Layout::Fit && native::Desktop::current().is_some() {
+            "backend_native_auto"
         } else {
             "backend_portal"
         };
@@ -667,8 +672,26 @@ impl View {
         preset: &Preset,
         target: Target,
     ) -> Result<String> {
+        let interactive_gpu = interactive_gpu(preset);
+        if interactive_gpu && preset.layout == Layout::Integer {
+            return Err("interactive_filter_unavailable".into());
+        }
+        if !portal_required(preset)
+            && preset.layout == Layout::Fit
+            && let Some(desktop) = native::Desktop::current()
+        {
+            let backend = futures_util::select_biased! {
+                reason = stop => return Ok(reason.unwrap_or("application shutdown").into()),
+                backend = native::discover(desktop, preset.filter).fuse() => backend,
+            };
+            if let Some(backend) = backend {
+                self.backend.set_subtitle(&self.t(desktop.label()));
+                self.window.set_visible(false);
+                return native::magnify(backend, stop, preset.filter).await;
+            }
+        }
         let needs_portal = portal_required(preset) || session::portal_desktop();
-        if needs_portal && target == Target::Active {
+        if needs_portal && target == Target::Active && !interactive_gpu {
             return Err("active_window_preset".into());
         }
         let conn = self
@@ -680,6 +703,9 @@ impl View {
                 reason = stop => return Ok(reason.unwrap_or("application shutdown").into()),
                 backend = async {
                     let Some(backend) = kwin::discover().await? else { return Ok::<_, Box<dyn std::error::Error>>(None) };
+                    if !kwin::supports_filter(&backend, preset.filter).await? {
+                        return Err("interactive_filter_unavailable".into());
+                    }
                     if kwin::supports_layout(&backend, preset.layout).await? { Ok(Some(backend)) } else { Err("kwin_upgrade".into()) }
                 }.fuse() => backend,
             }?;
@@ -691,8 +717,11 @@ impl View {
                     self.window.set_visible(false);
                     None
                 };
-                return kwin::magnify(backend, stop, preset.layout, active).await;
+                return kwin::magnify(backend, stop, preset.layout, preset.filter, active).await;
             }
+        }
+        if interactive_gpu {
+            return Err("interactive_filter_unavailable".into());
         }
         if !needs_portal
             && is_gnome()
@@ -934,7 +963,9 @@ impl View {
     }
 
     fn reset(&self, result: Result<String>, target: Target) {
-        if let Some(window) = self.capture_window.take() {
+        let preview = self.capture_window.take();
+        let showed_preview = preview.is_some();
+        if let Some(window) = preview {
             window.destroy();
         }
         self.launch.set_label(&self.t("choose_window"));
@@ -942,8 +973,18 @@ impl View {
         match result {
             Ok(reason) => {
                 diagnostic!("picalens stopped: {reason}");
-                self.status.set_title(&self.t("ready"));
-                show_controls |= reason == "PicaLens opened";
+                let key = if reason == session::PORTAL_CLOSED && !showed_preview {
+                    "portal_closed_before_frame"
+                } else {
+                    "ready"
+                };
+                self.status.set_title(&self.t(key));
+                if reason == native::FINISHED {
+                    // The compositor may have just transferred focus to a modal window.
+                    show_controls = false;
+                } else {
+                    show_controls |= reason == "PicaLens opened";
+                }
             }
             Err(error) => {
                 diagnostic!("picalens stopped: {error}");
@@ -951,10 +992,14 @@ impl View {
                 let key = match error.as_str() {
                     "no_frame"
                     | "window_portal_unavailable"
+                    | "portal_non_window"
                     | "kwin_upgrade"
                     | "gnome_unavailable"
                     | "gnome_no_windows"
                     | "gnome_source_lost"
+                    | "native_backend_lost"
+                    | "native_backend_busy"
+                    | "interactive_filter_unavailable"
                     | "no_active_window"
                     | "active_window_preset"
                     | "active_window_backend" => error.as_str(),
@@ -979,7 +1024,11 @@ impl View {
 fn portal_required(preset: &Preset) -> bool {
     preset.presentation != Presentation::Fullscreen
         || preset.layout == Layout::Integer
-        || preset.filter != Filter::Linear
+        || (preset.filter != Filter::Linear && !preset.filter.uses_gpu())
+}
+
+fn interactive_gpu(preset: &Preset) -> bool {
+    preset.presentation == Presentation::Fullscreen && preset.filter.uses_gpu()
 }
 
 fn is_gnome() -> bool {

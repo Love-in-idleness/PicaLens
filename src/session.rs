@@ -18,6 +18,8 @@ use crate::{capture::Capture, input::EisInput, preview::Preview};
 
 pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub type Stop = oneshot::Receiver<&'static str>;
+pub const PORTAL_CLOSED: &str = "portal session closed";
+const WINDOW_PORTAL_DESKTOPS: &[&str] = &["niri", "Hyprland", "DDE", "Deepin", "Treeland"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -26,12 +28,20 @@ pub enum Target {
 }
 
 pub fn portal_desktop() -> bool {
-    std::env::var("XDG_CURRENT_DESKTOP")
-        .unwrap_or_default()
+    desktop_matches(WINDOW_PORTAL_DESKTOPS)
+}
+
+pub fn desktop_matches(names: &[&str]) -> bool {
+    matches_desktop(
+        &std::env::var("XDG_CURRENT_DESKTOP").unwrap_or_default(),
+        names,
+    )
+}
+
+fn matches_desktop(desktop: &str, names: &[&str]) -> bool {
+    desktop
         .split(':')
-        .any(|desktop| {
-            desktop.eq_ignore_ascii_case("niri") || desktop.eq_ignore_ascii_case("Hyprland")
-        })
+        .any(|desktop| names.iter().any(|name| desktop.eq_ignore_ascii_case(name)))
 }
 
 pub async fn diagnostics() -> Result<()> {
@@ -95,7 +105,7 @@ pub async fn run(view: &Preview, experiment: bool, stop: Stop) -> Result<&'stati
         let selected = remote.start(&session, parent.as_ref()).await?.response()?;
         let granted = selected.devices();
         diagnostic!("portal granted_devices={granted:?}");
-        let stream = window_stream(selected.streams().unwrap_or_default())?;
+        let stream = window_stream(selected.streams().unwrap_or_default(), false)?;
         let capture = open_capture(&cast, &session, stream).await?;
         let input = match connect_input(&remote, &session, stream, granted).await {
             Ok(input) => Some(input),
@@ -142,7 +152,9 @@ pub async fn capture_window(
         };
         diagnostic!("portal ScreenCast.Start");
         let selected = cast.start(&session, parent.as_ref()).await?.response()?;
-        let stream = window_stream(selected.streams())?;
+        let legacy_types =
+            desktop_matches(&["Hyprland"]) && hyprland_legacy_types(&session).await?;
+        let stream = window_stream(selected.streams(), legacy_types)?;
         let capture = open_capture(&cast, &session, stream).await?;
         show(capture, stream.size()).await
     })
@@ -177,7 +189,7 @@ async fn with_session<T: SessionPortal>(
         futures_util::pin_mut!(closed);
         futures_util::select_biased! {
             reason = stop => Ok((reason.unwrap_or("application shutdown"), false)),
-            _ = closed.next().fuse() => Ok(("portal session closed", true)),
+            _ = closed.next().fuse() => Ok((PORTAL_CLOSED, true)),
             outcome = operation.fuse() => outcome.map(|reason| (reason, false)),
         }
     }
@@ -227,22 +239,70 @@ async fn select_window(
     Ok(())
 }
 
-fn window_stream(streams: &[Stream]) -> Result<&Stream> {
+async fn hyprland_legacy_types(session: &Session<'_, Screencast<'_>>) -> Result<bool> {
+    use zbus::{fdo, zvariant};
+
+    const HYPRLAND: &str = "org.freedesktop.impl.portal.desktop.hyprland";
+    let bus = zbus::connection::Builder::session()?
+        .method_timeout(Duration::from_secs(2))
+        .build()
+        .await?;
+    let dbus = fdo::DBusProxy::new(&bus).await?;
+    let owner = match dbus.get_name_owner(HYPRLAND.try_into()?).await {
+        Ok(owner) => owner,
+        Err(fdo::Error::NameHasNoOwner(_)) => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
+    let backend = zbus::Proxy::new(
+        &bus,
+        owner.clone(),
+        "/org/freedesktop/portal/desktop",
+        "org.freedesktop.impl.portal.ScreenCast",
+    )
+    .await?;
+    if backend.get_property::<u32>("version").await? != 3 {
+        return Ok(false);
+    }
+
+    // Another backend may handle ScreenCast while Hyprland serves different portals.
+    // Check that this particular session belongs to the legacy backend.
+    let context = zvariant::serialized::Context::new_dbus(zvariant::LE, 0);
+    let (path, _) =
+        zvariant::to_bytes(context, session)?.deserialize::<zvariant::OwnedObjectPath>()?;
+    let object = fdo::IntrospectableProxy::builder(&bus)
+        .destination(owner)?
+        .path(path)?
+        .build()
+        .await?;
+    match object.introspect().await {
+        Ok(xml) => Ok(xml.contains("name=\"org.freedesktop.impl.portal.Session\"")),
+        Err(fdo::Error::UnknownObject(_)) => Ok(false),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn is_window_source(source: Option<SourceType>, hyprland_legacy: bool) -> bool {
+    if hyprland_legacy {
+        // Hyprland's ScreenCast v3 shifted the flags again in its stream response.
+        source == Some(SourceType::Virtual)
+    } else {
+        source.is_none_or(|kind| kind == SourceType::Window)
+    }
+}
+
+fn window_stream(streams: &[Stream], hyprland_legacy: bool) -> Result<&Stream> {
     let [stream] = streams else {
         return Err(format!("expected one window stream, received {}", streams.len()).into());
     };
     diagnostic!(
-        "portal requested_source=Window granted_source={:?} node={} logical_size={:?} mapping_id={:?}",
+        "portal requested_source=Window reported_source={:?} hyprland_legacy_types={hyprland_legacy} node={} logical_size={:?} mapping_id={:?}",
         stream.source_type(),
         stream.pipe_wire_node_id(),
         stream.size(),
         stream.mapping_id(),
     );
-    if stream
-        .source_type()
-        .is_some_and(|kind| kind != SourceType::Window)
-    {
-        return Err("portal returned a source other than a window".into());
+    if !is_window_source(stream.source_type(), hyprland_legacy) {
+        return Err("portal_non_window".into());
     }
     Ok(stream)
 }
@@ -275,4 +335,35 @@ async fn connect_input(
         mapping.into(),
         granted.contains(DeviceType::Keyboard),
     )?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn matches_complete_desktop_names() {
+        for desktop in ["niri", "Hyprland", "DDE", "deepin:DDE", "treeland"] {
+            assert!(
+                matches_desktop(desktop, WINDOW_PORTAL_DESKTOPS),
+                "{desktop}"
+            );
+        }
+        for desktop in ["", "GNOME", "KDE", "NotDeepin"] {
+            assert!(
+                !matches_desktop(desktop, WINDOW_PORTAL_DESKTOPS),
+                "{desktop}"
+            );
+        }
+    }
+
+    #[test]
+    fn hyprland_v3_decodes_windows_and_rejects_shifted_monitor_flags() {
+        assert!(is_window_source(Some(SourceType::Virtual), true));
+        assert!(!is_window_source(Some(SourceType::Window), true));
+        assert!(!is_window_source(None, true));
+        assert!(is_window_source(Some(SourceType::Window), false));
+        assert!(!is_window_source(Some(SourceType::Virtual), false));
+        assert!(!is_window_source(Some(SourceType::Monitor), false));
+    }
 }

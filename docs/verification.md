@@ -65,6 +65,43 @@ target/debug/picalens-probe --experiment 2>&1 | tee /tmp/picalens-verification/p
 
 ## 结果表
 
+### FSR 1 与 SGSR 交互全屏
+
+在每组测试中都选中一扇已打开的窗口，确认画面经过所选滤镜，再依序点击九个位置、滚动并按 A 键。留边的点击和滚轮均未送达源窗或观察窗。两个滤镜的截图对比覆盖了线性放大和两种滤镜之间的差异。
+
+| 测试会话 | 原生 Wayland | XWayland |
+| --- | --- | --- |
+| Plasma 6，KWin 6.7.5，VirGL，1280×768 @ 100% | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
+| niri 26.04，嵌套 OpenGL ES，1280×768 @ 100% | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
+| Hyprland 0.53.3，VirGL，640×480 @ 100% | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
+
+Plasma 另在 1920×1080 @ 150% 通过了 SGSR 与 XWayland 的交互复测。Hyprland 另确认原窗打开测试弹窗时会结束放大，焦点留在弹窗。 [Plasma 记录](kwin-experiment.md) · [niri 记录](niri-experiment.md) · [Hyprland 记录](hyprland-experiment.md)
+
+### niri 与 Hyprland 单窗放大
+
+在 Ubuntu 26.04 虚拟机中使用 QEMU virtio GPU 和 VirGL。合成器通过虚拟 DRM 设备输出画面，PicaLens 读取 Portal 授权的实际 PipeWire 节点。
+
+| 会话 | 原生 Wayland 源窗 | XWayland 源窗 | 退出与恢复 |
+| --- | --- | --- | --- |
+| niri 26.04，GNOME Portal 50 | 持续接收 BGRx DMA-BUF 帧，FSR 1 启用，源窗从 538×786 改为 590×470 后继续出帧 | 持续接收 540×420 DMA-BUF 帧，FSR 1 启用，F11 切换预览模式 | `Super+F8` 停止预览。关闭源窗会结束 Portal 会话 |
+| Hyprland 0.53.3，Hyprland Portal 1.3.11 | 持续接收 560×440 BGRx DMA-BUF 帧，SGSR 启用 | 持续接收 560×440 BGRx DMA-BUF 帧，SGSR 启用 | `picalens toggle` 可结束预览并重新选窗。选中整屏会在打开 PipeWire 流之前被拒绝 |
+
+旧版 Hyprland ScreenCast 私有接口 v3 错移了流结果的 `source_type`。PicaLens 在确认当前会话由该后端提供后按旧编号识别窗口。新版接口使用标准编号。原始日志和截图位于云工作区的 `/workspace/scratch/picalens-lab/desktop-vm/`。 [旧版后端源码](https://github.com/hyprwm/xdg-desktop-portal-hyprland/blob/v1.3.11/src/portals/Screencopy.cpp) · [新版后端源码](https://github.com/hyprwm/xdg-desktop-portal-hyprland/blob/v1.4.0/src/portals/Screencopy.cpp)
+
+### niri 26.04 原窗口交互
+
+将带补丁的 niri 嵌套运行在 QEMU/VirGL 的 niri Wayland 会话中，从 PicaLens 的 `toggle` 入口点选源窗。原生 Wayland 和由 XWayland `:1` 托管的源窗各自依序收到 1–9 点位、滚轮和 A 键按下及释放。黑边点击与滚轮未送达源窗。观察窗在两轮输入期间未收到点击、滚轮或按键。Esc、切走焦点和选窗期间再次 `toggle` 各验证一次。日志位于 `/workspace/scratch/picalens-lab/desktop-vm/`。 [构建与试用](niri-experiment.md)
+
+### Hyprland 0.53.3 原窗口交互
+
+在 QEMU/VirGL 的 Hyprland `0.53.3+ds-4` 会话中加载匹配的后台组件。从 PicaLens 界面的「选择窗口」和 `toggle` 分别开始放大。原生 Wayland、XWayland 源窗各依序收到 1–9 点位、滚轮和 A 键。XWayland 记录到两个方向的非零滚轮增量。黑边输入未送达源窗，观察窗未记录误投。Esc、再次 `toggle`、关闭源窗和切换焦点均结束放大。两款交互后端均在 100% 输出缩放下验收。 [构建与试用](hyprland-experiment.md)
+
+### DDE Wayland 接入检查
+
+仅为 PicaLens 进程设置 `XDG_CURRENT_DESKTOP=DDE`，沿用 niri 会话提供的窗口流。`picalens toggle` 打开系统选窗器，选中原生 Wayland 测试窗后持续接收 538×786 BGRx DMA-BUF 帧，再次执行命令结束会话。实际 Treeland 会话中的原生 Wayland 与 XWayland 选窗和取帧仍待验收。 [DDE Portal 单窗流实现](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/7f1721594b424161a90afe4ecdc936f6fd8767c0/src/wayland/treelandintegration.cpp#L112)
+
+已从 GitHub 获取 Treeland 0.12.1 源码。德国 FAU、澳大利亚 AARNet、瑞典 Lysator 和日本 JAIST 的 Deepin 镜像在当前云工作区的代理检查中均返回 CONNECT 403。FAU 域名访问请求未获批准。该版本的 Treeland 屏幕缩放动作仍是占位实现，DDE Portal 的 Wayland 上下文只创建 ScreenCast 等已实现接口。 [Deepin 社区镜像](https://www.deepin.org/en/mirrors/packages/) · [Treeland 0.12.1](https://github.com/linuxdeepin/treeland/tree/0.12.1) · [DDE Portal 上下文](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/7f1721594b424161a90afe4ecdc936f6fd8767c0/src/wayland/portalwaylandcontext.cpp)
+
 ### Plasma 6 Wayland 验收
 
 | 源窗 | OBS 与探针捕获 | 并排输入 | 全屏覆盖输入 |
