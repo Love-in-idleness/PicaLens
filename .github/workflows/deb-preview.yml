@@ -2,22 +2,22 @@ name: Debian preview
 
 on:
   push:
-    tags: [v0.2.0]
+    tags: [v0.2.1]
 
 permissions:
   contents: read
 
 jobs:
-  build:
+  build-kwin:
     runs-on: ubuntu-latest
     strategy:
       matrix:
         include:
           - image: debian:trixie
-            target: debian13
+            target: kwin-debian13
             kwin_pin: "=4:6.3.6-1+deb13u1"
           - image: ubuntu:26.10
-            target: ubuntu26.10
+            target: kwin-ubuntu26.10
             kwin_pin: "=4:6.7.5-0ubuntu1"
     container: ${{ matrix.image }}
     env:
@@ -25,41 +25,110 @@ jobs:
       LANG: C.UTF-8
       KWIN_PIN: ${{ matrix.kwin_pin }}
     steps:
-      - name: Install Debian build dependencies
+      - name: Install KWin build dependencies
         run: |
           apt-get update
           apt-get install -y --no-install-recommends \
-            g++ git curl ca-certificates cmake ninja-build dpkg-dev extra-cmake-modules \
-            "kwin-dev$KWIN_PIN" "kwin-wayland$KWIN_PIN" libadwaita-1-dev libclang-dev libgtk-4-dev \
-            libdrm-dev libpipewire-0.3-dev libvulkan-dev libwayland-dev libxkbcommon-dev pkg-config python3
+            g++ git ca-certificates cmake ninja-build extra-cmake-modules \
+            "kwin-dev$KWIN_PIN" "kwin-wayland$KWIN_PIN" libdrm-dev libvulkan-dev \
+            libwayland-dev libxkbcommon-dev pkg-config python3
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
+      - run: bash packaging/build-kwin.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: build/deb/kwin-backends/${{ matrix.target }}
+          if-no-files-found: error
+
+  build-deb:
+    needs: build-kwin
+    runs-on: ubuntu-latest
+    container: debian:trixie
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LANG: C.UTF-8
+    steps:
+      - name: Install package build dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            g++ git curl ca-certificates dpkg-dev libadwaita-1-dev \
+            libclang-dev libgtk-4-dev libpipewire-0.3-dev pkg-config python3
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: kwin-*
+          path: build/deb/kwin-backends
       - name: Install Rust
         run: |
           curl --fail --silent --show-error --location https://sh.rustup.rs -o /tmp/rustup-init.sh
           sh /tmp/rustup-init.sh -y --profile minimal --default-toolchain 1.100.0 --no-modify-path
           printf '%s\n' "$HOME/.cargo/bin" >> "$GITHUB_PATH"
-      - name: Build and check the package
+      - name: Build the unified package
         run: |
           bash packaging/build-deb.sh
           cd build/deb
           sha256sum -c SHA256SUMS
           dpkg-deb --info ./*.deb
-          if dpkg-deb -f ./*.deb Depends | grep -qi kwin; then
+          if dpkg-deb -f ./*.deb Depends Pre-Depends | grep -qi kwin; then
             exit 1
           fi
-          dpkg -i ./*.deb
-          test -L "$(qtpaths6 --plugin-dir)/kwin/effects/plugins/picalens.so"
-          picalens --help
       - uses: actions/upload-artifact@v4
         with:
-          name: picalens-${{ matrix.target }}
-          path: build/deb/*.deb
+          name: picalens-deb
+          path: |
+            build/deb/*.deb
+            build/deb/SHA256SUMS
           if-no-files-found: error
 
+  verify:
+    needs: build-deb
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - image: debian:trixie
+            kwin_pin: "=4:6.3.6-1+deb13u1"
+          - image: ubuntu:26.10
+            kwin_pin: "=4:6.7.5-0ubuntu1"
+    container: ${{ matrix.image }}
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      LANG: C.UTF-8
+      KWIN_PIN: ${{ matrix.kwin_pin }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: picalens-deb
+          path: artifacts
+      - name: Install without KWin
+        run: |
+          cd artifacts
+          sha256sum -c SHA256SUMS
+          apt-get update
+          apt-get install -y --no-install-recommends ./*.deb
+          test ! -e /usr/bin/kwin_wayland
+          picalens --help
+      - name: Verify automatic KWin backend selection
+        run: |
+          apt-get install -y --no-install-recommends "kwin-wayland$KWIN_PIN" "libkwin6$KWIN_PIN"
+          kwin_lib=$(dpkg-query -L libkwin6 | sed -n '/\/libkwin\.so\.6$/p')
+          plugin="${kwin_lib%/*}/qt6/plugins/kwin/effects/plugins/picalens.so"
+          backend="/usr/lib/picalens/kwin/backends/${KWIN_PIN#=}/picalens.so"
+          test "$(readlink "$plugin")" = "$backend"
+          ldd -r "$plugin" > kwin-linkage.txt 2>&1
+          if grep -E 'not found|undefined symbol' kwin-linkage.txt; then
+            exit 1
+          fi
+          dpkg -r picalens
+          test ! -L "$plugin"
+
   release:
-    needs: build
+    needs: verify
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -69,16 +138,15 @@ jobs:
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
-          pattern: picalens-*
+          name: picalens-deb
           path: artifacts
-          merge-multiple: true
       - name: Publish the preview
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          (cd artifacts && sha256sum -- *.deb > SHA256SUMS)
+          (cd artifacts && sha256sum -c SHA256SUMS)
           gh release create "$GITHUB_REF_NAME" \
-            artifacts/*.deb artifacts/SHA256SUMS \
+            "artifacts/picalens_${GITHUB_REF_NAME#v}-1_amd64.deb" artifacts/SHA256SUMS \
             --repo "$GITHUB_REPOSITORY" --verify-tag --prerelease \
             --title "PicaLens ${GITHUB_REF_NAME#v} · Wayland preview" \
             --notes-file "packaging/$GITHUB_REF_NAME.md"

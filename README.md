@@ -6,10 +6,10 @@
 
 ## 安装预览版
 
-从发布页选择 Ubuntu 26.10 或 Debian 13 的 amd64 安装包。以 Ubuntu 为例。 [GitHub Releases](https://github.com/Love-in-idleness/PicaLens/releases)
+Ubuntu 26.10 和 Debian 13 的 amd64 系统共用同一个安装包。安装时会自动启用与系统 KWin 版本匹配的后台。 [GitHub Releases](https://github.com/Love-in-idleness/PicaLens/releases)
 
 ```sh
-sudo apt install ./picalens_0.2.0-1ubuntu26.10_amd64.deb
+sudo apt install ./picalens_0.2.1-1_amd64.deb
 ```
 
 升级后重新登录 Plasma，会话会加载新版 KWin 后台。
@@ -69,7 +69,7 @@ target/debug/picalens
 
 桌面启动器位于 [`data/`](data/)。本地安装时，让启动器的 `Exec=picalens` 能在会话的 `PATH` 中找到应用，再将 `.desktop` 文件放入桌面应用目录。Plasma 交互模式还需部署匹配的 KWin 后台组件。
 
-在 Debian 13、Ubuntu 26.10 或 Ubuntu 27.04 上可用 `bash packaging/build-deb.sh` 生成安装包与校验文件，输出在 `build/deb/`。构建依赖见[发布流程](.github/workflows/deb-preview.yml)。
+构建统一安装包时，先在 Debian 13 和 Ubuntu 26.10 上分别运行 `bash packaging/build-kwin.sh`。将两个系统生成的 `build/deb/kwin-backends/` 子目录汇总到 Debian 13 的同一位置，再运行 `bash packaging/build-deb.sh`。安装包和校验文件输出到 `build/deb/`。 [构建依赖与发布流程](.github/workflows/deb-preview.yml)
 
 ### 技术验证
 

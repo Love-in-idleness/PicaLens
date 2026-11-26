@@ -7,44 +7,39 @@ repo=$PWD
 build_dir=$(realpath -m -- "${PICALENS_BUILD_DIR:-$repo/build/deb}")
 mkdir -p -- "$build_dir"
 
-. /etc/os-release
-case "$ID:$VERSION_CODENAME" in
-    debian:trixie) target=debian13 ;;
-    ubuntu:stonking) target=ubuntu26.10 ;;
-    ubuntu:tenacious) target=ubuntu27.04 ;;
-    *) printf 'Build on Debian 13, Ubuntu 26.10, or Ubuntu 27.04.\n' >&2; exit 1 ;;
-esac
-
-kwin_version=$(dpkg-query -W -f='${Version}' kwin-dev)
-for package in kwin-wayland libkwin6; do
-    if [[ $(dpkg-query -W -f='${Version}' "$package") != "$kwin_version" ]]; then
-        printf '%s must match kwin-dev %s.\n' "$package" "$kwin_version" >&2
-        exit 1
-    fi
-done
-
-qt_plugins=$(qtpaths6 --plugin-dir)
-kwin_lib=$(dpkg-query -L libkwin6 | sed -n '/\/libkwin\.so\.6$/p')
-test -f "$kwin_lib"
-backend_root=/usr/lib/picalens
-backend_path=$backend_root/kwin/effects/plugins/picalens.so
 architecture=$(dpkg --print-architecture)
+multiarch=$(dpkg-architecture -qDEB_HOST_MULTIARCH)
 app_version=$(sed -n 's/^version = "\([^"]*\)"$/\1/p' Cargo.toml)
-deb_version=$app_version-1$target
+deb_version=$app_version-1
 dpkg --validate-version "$deb_version"
-
-export CARGO_TARGET_DIR="$build_dir/cargo"
-cargo build --locked --release --bin picalens
-cmake -S kwin -B "$build_dir/kwin" -G Ninja \
-    -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr \
-    -DKDE_INSTALL_PLUGINDIR="$backend_root"
-cmake --build "$build_dir/kwin"
 
 work=$(mktemp -d "$build_dir/stage.XXXXXX")
 trap 'rm -rf -- "$work"' EXIT
 stage=$work/picalens
 install -d "$stage/DEBIAN" "$work/debian"
-DESTDIR="$stage" cmake --install "$build_dir/kwin" --strip
+
+for target in kwin-debian13 kwin-ubuntu26.10; do
+    artifact=$build_dir/kwin-backends/$target
+    if [[ ! -s $artifact/picalens.so || ! -s $artifact/abi ]]; then
+        printf 'Missing KWin build artifacts in %s. Run packaging/build-kwin.sh on the target distribution.\n' "$artifact" >&2
+        exit 1
+    fi
+    read -r backend_arch kwin_version < "$artifact/abi"
+    if [[ $backend_arch != "$architecture" ]]; then
+        printf 'KWin backend %s has architecture %s, expected %s.\n' "$target" "$backend_arch" "$architecture" >&2
+        exit 1
+    fi
+    dpkg --validate-version "$kwin_version"
+    backend=$stage/usr/lib/picalens/kwin/backends/$kwin_version/picalens.so
+    if [[ -e $backend ]]; then
+        printf 'Duplicate KWin backend for %s.\n' "$kwin_version" >&2
+        exit 1
+    fi
+    install -Dm644 "$artifact/picalens.so" "$backend"
+done
+
+export CARGO_TARGET_DIR="$build_dir/cargo"
+cargo build --locked --release --bin picalens
 install -Dm755 "$CARGO_TARGET_DIR/release/picalens" "$stage/usr/bin/picalens"
 strip --strip-unneeded "$stage/usr/bin/picalens"
 install -Dm644 data/io.github.LoveInIdleness.PicaLens.desktop \
@@ -92,9 +87,9 @@ Description: Magnify Wayland windows and launch games with Gamescope
 EOF
 
 # Let KWin discover the optional plugin only while its packaged ABI matches.
-sed -e "s|@BACKEND@|$backend_path|" \
-    -e "s|@PLUGIN@|$qt_plugins/kwin/effects/plugins/picalens.so|" \
-    -e "s|@KWIN_LIB@|$kwin_lib|" -e "s|@KWIN_VERSION@|$kwin_version|" \
+kwin_lib=/usr/lib/$multiarch/libkwin.so.6
+plugin=/usr/lib/$multiarch/qt6/plugins/kwin/effects/plugins/picalens.so
+sed -e "s|@PLUGIN@|$plugin|" -e "s|@KWIN_LIB@|$kwin_lib|" \
     packaging/kwin-link.sh > "$stage/DEBIAN/postinst"
 install -m755 "$stage/DEBIAN/postinst" "$stage/DEBIAN/prerm"
 chmod 755 "$stage/DEBIAN/postinst"
