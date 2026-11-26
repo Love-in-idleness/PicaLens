@@ -98,7 +98,7 @@ Plasma 另在 1920×1080 @ 150% 通过了 SGSR 与 XWayland 的交互复测。Hy
 
 ### DDE Wayland 的 Treeland 0.12.1
 
-从 GitHub 获取 Treeland 0.12.1、dde-wlroots 0.20.2.1 等源码，构建依赖使用 Ubuntu 软件包归档。在 Ubuntu 26.10 虚拟机中启动真实 Treeland，使用 VirGL、OpenGL ES 3.1 以上、640×480 @ 100%。测试会话直接启动合成器，完整 DDM 登录流程与物理显卡性能仍待验收。 [构建与使用](treeland-experiment.md)
+从 GitHub 获取 Treeland 0.12.1、dde-wlroots 0.20.2.1 等源码，构建依赖使用 Ubuntu 软件包归档。在 Ubuntu 26.10 虚拟机中启动真实 Treeland，使用 VirGL、OpenGL ES 3.1 以上、640×480 @ 100%。测试会话直接启动合成器，完整 DDM 登录流程与物理显卡性能仍待验收。 [后端与使用](treeland-experiment.md)
 
 在 Treeland 会话中选中原生 Wayland 或 XWayland 源窗，两类窗口在 FSR 1 和 SGSR 下均依次收到九个位置的点击、双向滚轮和 A 键按下及释放。黑边的点击和滚轮未送达源窗或观察窗。关闭正在放大的原生 Wayland 窗口后，可以继续选择并放大 XWayland 窗口。XWayland 的 `:0` 已通过 `xdpyinfo -queryExtensions` 确认具有 XWAYLAND 扩展。
 

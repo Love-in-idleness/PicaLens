@@ -34,7 +34,7 @@ niri 26.04 和 Hyprland 0.53.3 的 PicaLens 后端支持等比全屏，滤镜可
 
 ### DDE Wayland（Treeland）
 
-DDE Wayland 使用同一个「选择窗口」入口和 `picalens toggle` 命令。安装兼容的 Treeland 0.12.1 后端后，等比交互全屏支持线性、FSR 1 和 SGSR，可操作原生 Wayland 与 XWayland 应用。窗口预览可使用提供窗口来源的 `xdg-desktop-portal-dde` 与 PipeWire。 [Treeland 构建与使用](docs/treeland-experiment.md)
+DDE Wayland 使用同一个「选择窗口」入口和 `picalens toggle` 命令。等比交互全屏需要带 PicaLens 后端的 Treeland 构建，可使用线性、FSR 1 和 SGSR 操作原生 Wayland 与 XWayland 应用。兼容的 Treeland 构建仍待发布。窗口预览可使用提供窗口来源的 `xdg-desktop-portal-dde` 与 PipeWire。 [Treeland 后端与使用](docs/treeland-experiment.md)
 
 ### GNOME
 
