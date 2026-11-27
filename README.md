@@ -26,7 +26,7 @@ Plasma 6 会话中，兼容的 KWin 后台支持交互全屏，可以点击、�
 
 ### niri 和 Hyprland
 
-niri 26.04 和 Hyprland 0.53.3 的 PicaLens 后端支持等比全屏，滤镜可选线性、FSR 1 和 SGSR。两种 GPU 滤镜都在隔离会话中通过了原生 Wayland 和 XWayland 的原窗口输入测试。 [niri 后端](docs/niri-experiment.md) · [Hyprland 后端](docs/hyprland-experiment.md)
+niri 26.04 使用独立 fork 中的交互后台，Hyprland 0.53.3 使用匹配的后台组件。两者都支持等比全屏，可选线性、FSR 1 和 SGSR。原生 Wayland 和 XWayland 的原窗口输入均已在隔离会话中验证。 [niri 后端](docs/niri-experiment.md) · [Hyprland 后端](docs/hyprland-experiment.md)
 
 只读预览使用 ScreenCast Portal 选窗和 PipeWire 单窗流。niri 会话使用 `xdg-desktop-portal-gnome`，Hyprland 会话使用 `xdg-desktop-portal-hyprland`。Hyprland 旧版选窗器若显示多个来源标签，请切换到 **Window** 再选择应用。 [验收记录](docs/verification.md#niri-与-hyprland-单窗放大) · [niri 采集文档](https://niri-wm.github.io/niri/Screencasting.html) · [Hyprland Portal 文档](https://wiki.hypr.land/hypr-ecosystem/user/xdg-desktop-portal-hyprland/)
 
