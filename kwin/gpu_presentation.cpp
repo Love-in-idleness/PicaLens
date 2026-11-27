@@ -11,11 +11,19 @@
 #include "scene/windowitem.h"
 
 #include <QFile>
+#include <QFileInfo>
+#include <QElapsedTimer>
+#include <QLibrary>
+#include <QProcess>
 #include <QRegion>
+#include <QStandardPaths>
+#include <QTemporaryFile>
 
 #include <algorithm>
 #include <array>
 #include <cmath>
+#include <cstdint>
+#include <cstring>
 
 namespace PicaLens
 {
@@ -222,22 +230,280 @@ private:
     GLint program, vao, activeTexture, texture, sampler;
 };
 
-QSize extent(const QSize &source, const QSize &destination, int maxTexture)
+constexpr qsizetype MaxPixels = 3840 * 2160;
+constexpr qsizetype FrameBytes = MaxPixels * 4;
+constexpr auto WorkerPath = "/usr/lib/picalens/picalens-render";
+
+bool fits(const QSize &size)
+{
+    return !size.isEmpty() && size.width() <= 8192 && size.height() <= 8192
+        && qsizetype(size.width()) * size.height() <= MaxPixels;
+}
+
+QSize extent(const QSize &source, const QSize &destination, int maxTexture, bool anime)
 {
     if (source.isEmpty() || destination.isEmpty()) {
         return {};
     }
-    constexpr double maxPixels = 3840. * 2160.;
     const double w = destination.width();
     const double h = destination.height();
-    const double scale = std::min({1., 2. * source.width() / w, 2. * source.height() / h,
-                                   std::sqrt(maxPixels / (w * h)), double(maxTexture) / std::max(w, h)});
-    const QSize size(int(std::floor(w * scale)), int(std::floor(h * scale)));
-    if (size.width() < source.width() || size.height() < source.height() || size == source) {
+    double scale = std::min({1., std::sqrt(double(MaxPixels) / (w * h)),
+                            double(maxTexture) / std::max(w, h)});
+    if (!anime) {
+        scale = std::min({scale, 2. * source.width() / w, 2. * source.height() / h});
+    }
+    const QSize size(std::max(1, int(std::floor(w * scale))), std::max(1, int(std::floor(h * scale))));
+    if (!anime && (size.width() < source.width() || size.height() < source.height() || size == source)) {
         return {};
     }
     return size;
 }
+
+QString compositorRenderNode()
+{
+    QLibrary egl(QStringLiteral("EGL"), 1);
+    using Current = void *(*)();
+    using GetProc = QFunctionPointer (*)(const char *);
+    using QueryDisplay = unsigned int (*)(void *, int, intptr_t *);
+    using QueryDevice = const char *(*)(void *, int);
+    const auto display = reinterpret_cast<Current>(egl.resolve("eglGetCurrentDisplay"));
+    const auto proc = reinterpret_cast<GetProc>(egl.resolve("eglGetProcAddress"));
+    if (!display || !proc || !display()) {
+        return {};
+    }
+    const auto queryDisplay = reinterpret_cast<QueryDisplay>(proc("eglQueryDisplayAttribEXT"));
+    const auto queryDevice = reinterpret_cast<QueryDevice>(proc("eglQueryDeviceStringEXT"));
+    intptr_t device = 0;
+    if (queryDisplay && queryDevice && queryDisplay(display(), 0x322c, &device) && device) {
+        // EGL_DEVICE_EXT and EGL_DRM_RENDER_NODE_FILE_EXT.
+        return QString::fromUtf8(queryDevice(reinterpret_cast<void *>(device), 0x3377));
+    }
+    return {};
+}
+
+class PixelBufferBinding
+{
+public:
+    PixelBufferBinding(bool pack, GLuint buffer)
+        : target(pack ? GL_PIXEL_PACK_BUFFER : GL_PIXEL_UNPACK_BUFFER)
+        , entries(pack ? std::array<GLenum, 4>{GL_PACK_ALIGNMENT, GL_PACK_ROW_LENGTH, GL_PACK_SKIP_PIXELS, GL_PACK_SKIP_ROWS}
+                       : std::array<GLenum, 4>{GL_UNPACK_ALIGNMENT, GL_UNPACK_ROW_LENGTH, GL_UNPACK_SKIP_PIXELS, GL_UNPACK_SKIP_ROWS})
+    {
+        glGetIntegerv(pack ? GL_PIXEL_PACK_BUFFER_BINDING : GL_PIXEL_UNPACK_BUFFER_BINDING, &previous);
+        glBindBuffer(target, buffer);
+        for (size_t index = 0; index < entries.size(); ++index) {
+            glGetIntegerv(entries[index], &values[index]);
+            glPixelStorei(entries[index], index == 0 ? 4 : 0);
+        }
+    }
+
+    ~PixelBufferBinding()
+    {
+        for (size_t index = 0; index < entries.size(); ++index) {
+            glPixelStorei(entries[index], values[index]);
+        }
+        glBindBuffer(target, previous);
+    }
+
+private:
+    const GLenum target;
+    const std::array<GLenum, 4> entries;
+    std::array<GLint, 4> values{};
+    GLint previous = 0;
+};
+
+class RenderWorker
+{
+public:
+    RenderWorker(QString device, std::function<void()> repaint)
+        : m_device(std::move(device)), m_repaint(std::move(repaint)) {}
+
+    ~RenderWorker()
+    {
+        if (m_process) {
+            auto *process = m_process.release();
+            QObject::disconnect(process, nullptr, nullptr, nullptr);
+            if (process->state() != QProcess::NotRunning) {
+                QObject::connect(process, &QProcess::finished, process, &QObject::deleteLater);
+                process->kill();
+            } else {
+                delete process;
+            }
+        }
+        if (m_fence) {
+            glDeleteSync(m_fence);
+        }
+        if (m_buffer) {
+            glDeleteBuffers(1, &m_buffer);
+        }
+        if (m_upload) {
+            glDeleteBuffers(1, &m_upload);
+        }
+    }
+
+    bool update(const QSize &source, const QSize &output, Filter filter, GLuint outputTexture)
+    {
+        if (!m_process) {
+            m_sourceSize = source;
+            m_outputSize = output;
+            if (!start(filter)) {
+                return false;
+            }
+        } else if (source != m_sourceSize || output != m_outputSize) {
+            // A pending buffer belongs to the geometry at the time it was read.
+            m_error = "render_size";
+            return false;
+        }
+        while (m_process->canReadLine()) {
+            const QByteArray line = m_process->readLine().trimmed();
+            if (line == "ready" && !m_ready) {
+                m_ready = true;
+            } else if (line == "frame" && m_inFlight) {
+                if (!upload(output, outputTexture)) {
+                    return false;
+                }
+                m_inFlight = false;
+                m_hasFrame = true;
+            } else {
+                if (line == "error render_gpu_missing") m_error = "render_gpu_missing";
+                if (line == "error render_gpu_driver") m_error = "render_gpu_driver";
+                if (line == "error render_size") m_error = "render_size";
+                return false;
+            }
+        }
+        if (m_process->state() == QProcess::NotRunning || (pending() && m_deadline.hasExpired(10000))) {
+            return false;
+        }
+        if (!m_ready || m_inFlight || !m_fence) {
+            return true;
+        }
+        const auto status = glClientWaitSync(m_fence, GL_SYNC_FLUSH_COMMANDS_BIT, 0);
+        if (status == GL_TIMEOUT_EXPIRED) {
+            return true;
+        }
+        if (status == GL_WAIT_FAILED) {
+            return false;
+        }
+        glDeleteSync(m_fence);
+        m_fence = nullptr;
+        const PixelBufferBinding binding(true, m_buffer);
+        auto *bytes = glMapBufferRange(GL_PIXEL_PACK_BUFFER, 0, m_sourceBytes, GL_MAP_READ_BIT);
+        if (!bytes) {
+            return false;
+        }
+        std::memcpy(m_shared, bytes, m_sourceBytes);
+        if (!glUnmapBuffer(GL_PIXEL_PACK_BUFFER)) {
+            return false;
+        }
+        const auto request = QByteArray::number(source.width()) + ' ' + QByteArray::number(source.height())
+            + ' ' + QByteArray::number(output.width()) + ' ' + QByteArray::number(output.height()) + '\n';
+        if (m_process->write(request) != request.size()) {
+            return false;
+        }
+        m_inFlight = true;
+        m_deadline.restart();
+        return true;
+    }
+
+    bool capture(const QSize &source)
+    {
+        if (!m_buffer) {
+            glGenBuffers(1, &m_buffer);
+            if (!m_buffer) {
+                return false;
+            }
+        }
+        const PixelBufferBinding binding(true, m_buffer);
+        const qsizetype bytes = qsizetype(source.width()) * source.height() * 4;
+        if (bytes != m_sourceBytes) {
+            m_sourceBytes = bytes;
+            glBufferData(GL_PIXEL_PACK_BUFFER, bytes, nullptr, GL_STREAM_READ);
+        }
+        glReadPixels(0, 0, source.width(), source.height(), GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        m_fence = glFenceSync(GL_SYNC_GPU_COMMANDS_COMPLETE, 0);
+        if (!m_inFlight) {
+            m_deadline.restart();
+        }
+        dirty = false;
+        return m_fence != nullptr;
+    }
+
+    bool canCapture() const { return dirty && m_ready && !m_fence; }
+    bool pending() const { return !m_ready || m_inFlight || m_fence; }
+    bool hasFrame() const { return m_hasFrame; }
+    const char *error() const { return m_error; }
+    bool dirty = true;
+
+private:
+    bool upload(const QSize &output, GLuint texture)
+    {
+        if (!m_upload) {
+            glGenBuffers(1, &m_upload);
+            if (!m_upload) {
+                return false;
+            }
+        }
+        const PixelBufferBinding binding(false, m_upload);
+        const qsizetype bytes = qsizetype(output.width()) * output.height() * 4;
+        glBufferData(GL_PIXEL_UNPACK_BUFFER, bytes, nullptr, GL_STREAM_DRAW);
+        auto *staging = glMapBufferRange(GL_PIXEL_UNPACK_BUFFER, 0, bytes,
+                                        GL_MAP_WRITE_BIT | GL_MAP_INVALIDATE_BUFFER_BIT);
+        if (!staging) {
+            return false;
+        }
+        std::memcpy(staging, m_shared + FrameBytes, bytes);
+        if (!glUnmapBuffer(GL_PIXEL_UNPACK_BUFFER)) {
+            return false;
+        }
+        glBindTexture(GL_TEXTURE_2D, texture);
+        glTexSubImage2D(GL_TEXTURE_2D, 0, 0, 0, output.width(), output.height(),
+                        GL_RGBA, GL_UNSIGNED_BYTE, nullptr);
+        return true;
+    }
+
+    bool start(Filter filter)
+    {
+        const QString runtime = QStandardPaths::writableLocation(QStandardPaths::RuntimeLocation);
+        if (runtime.isEmpty() || !GpuPresentation::workerAvailable()) {
+            return false;
+        }
+        m_file.setFileTemplate(runtime + QStringLiteral("/picalens-XXXXXX.rgba"));
+        if (!m_file.open() || !m_file.resize(2 * FrameBytes)) {
+            return false;
+        }
+        m_shared = m_file.map(0, 2 * FrameBytes);
+        if (!m_shared) {
+            return false;
+        }
+        const auto name = filter == Filter::Anime4k ? QStringLiteral("anime4k")
+            : filter == Filter::Fsr ? QStringLiteral("fsr") : QStringLiteral("sgsr");
+        m_process = std::make_unique<QProcess>();
+        m_process->setProcessChannelMode(QProcess::ForwardedErrorChannel);
+        QObject::connect(m_process.get(), &QProcess::readyReadStandardOutput, m_process.get(), m_repaint);
+        QObject::connect(m_process.get(), &QProcess::stateChanged, m_process.get(), m_repaint);
+        const QString hint = m_device.isEmpty() ? compositorRenderNode() : QString();
+        m_deadline.start();
+        m_process->start(QString::fromLatin1(WorkerPath),
+                         {QStringLiteral("--run"), name, m_device, hint, m_file.fileName(), QStringLiteral("flip")});
+        return true;
+    }
+
+    QString m_device;
+    std::function<void()> m_repaint;
+    QTemporaryFile m_file;
+    uchar *m_shared = nullptr;
+    std::unique_ptr<QProcess> m_process;
+    QElapsedTimer m_deadline;
+    QSize m_sourceSize, m_outputSize;
+    GLuint m_buffer = 0;
+    GLuint m_upload = 0;
+    GLsync m_fence = nullptr;
+    qsizetype m_sourceBytes = 0;
+    bool m_ready = false;
+    bool m_inFlight = false;
+    bool m_hasFrame = false;
+    const char *m_error = "render_worker_failed";
+};
 
 QPointF glPoint(const KWin::RenderViewport &viewport, const KWin::RenderTarget &target, QPointF logical)
 {
@@ -248,13 +514,18 @@ QPointF glPoint(const KWin::RenderViewport &viewport, const KWin::RenderTarget &
 }
 
 struct GpuPresentation::Pipeline {
-    explicit Pipeline(Filter filter) : filter(filter) {}
+    Pipeline(Filter filter, const QString &device, std::function<void()> repaint) : filter(filter)
+    {
+        if (filter == Filter::Anime4k || !device.isEmpty()) {
+            worker = std::make_unique<RenderWorker>(device, std::move(repaint));
+        }
+    }
     ~Pipeline() { if (vao) glDeleteVertexArrays(1, &vao); }
 
     bool initialize()
     {
         if (vao) {
-            return upscale.id && present.id && (filter != Filter::Fsr || sharpen.id);
+            return present.id && (worker || (upscale.id && (filter != Filter::Fsr || sharpen.id)));
         }
         const bool desktop = epoxy_is_desktop_gl();
         if (epoxy_gl_version() < (desktop ? 40 : 31)) {
@@ -262,17 +533,17 @@ struct GpuPresentation::Pipeline {
         }
         const QByteArray version = desktop ? "#version 400 core\n"
                                            : "#version 310 es\nprecision highp float;\nprecision highp int;\n";
-        if (filter == Filter::Fsr) {
+        if (!worker && filter == Filter::Fsr) {
             const auto fsr = shaderSource("fsr1.glsl");
             upscale.load(version, "#define FSR_EASU_F\n" + fsr + shaderSource("easu-pass.glsl"));
             sharpen.load(version, "#define FSR_RCAS_F\n" + fsr + shaderSource("rcas-pass.glsl"));
-        } else {
+        } else if (!worker) {
             upscale.load(version, shaderSource("sgsr1.glsl") + shaderSource("sgsr-pass.glsl"));
         }
         present.load(version, Present);
         glGenVertexArrays(1, &vao);
         glGetIntegerv(GL_MAX_TEXTURE_SIZE, &maxTexture);
-        return vao && upscale.id && present.id && (filter != Filter::Fsr || sharpen.id);
+        return vao && present.id && (worker || (upscale.id && (filter != Filter::Fsr || sharpen.id)));
     }
 
     void drawPass(const Program &program, GLuint input, const Target &destination, const QSize &size)
@@ -284,14 +555,44 @@ struct GpuPresentation::Pipeline {
     }
 
     Filter filter;
+    std::unique_ptr<RenderWorker> worker;
     Program upscale, sharpen, present;
     Target source, intermediate, output;
     GLuint vao = 0;
     GLint maxTexture = 0;
+    const char *error = "interactive_filter_unavailable";
 };
 
-GpuPresentation::GpuPresentation(Filter filter) : m_pipeline(std::make_unique<Pipeline>(filter)) {}
+GpuPresentation::GpuPresentation(Filter filter, const QString &device, std::function<void()> repaint)
+    : m_pipeline(std::make_unique<Pipeline>(filter, device, std::move(repaint))) {}
 GpuPresentation::~GpuPresentation() = default;
+
+bool GpuPresentation::workerAvailable()
+{
+    return QFileInfo(QString::fromLatin1(WorkerPath)).isExecutable();
+}
+
+void GpuPresentation::sourceDamaged()
+{
+    if (m_pipeline->worker) {
+        m_pipeline->worker->dirty = true;
+    }
+}
+
+bool GpuPresentation::pending() const
+{
+    return m_pipeline->worker && m_pipeline->worker->pending();
+}
+
+bool GpuPresentation::hasFrame() const
+{
+    return !m_pipeline->worker || m_pipeline->worker->hasFrame();
+}
+
+const char *GpuPresentation::error() const
+{
+    return m_pipeline->error;
+}
 
 bool GpuPresentation::paint(KWin::EffectWindow *window, const Presentation &presentation,
                             const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
@@ -325,21 +626,30 @@ bool GpuPresentation::paint(KWin::EffectWindow *window, const Presentation &pres
     if (!p.initialize()) {
         return false;
     }
-    const QSize processed = extent(sourceSize, destinationSize, p.maxTexture);
-    if (processed.isEmpty() || !p.source.allocate(sourceSize) || !p.output.allocate(processed)
-        || (p.filter == Filter::Fsr && !p.intermediate.allocate(processed))) {
+    const QSize processed = extent(sourceSize, destinationSize, p.worker ? std::min(8192, p.maxTexture) : p.maxTexture,
+                                   p.filter == Filter::Anime4k);
+    if (processed.isEmpty() || (p.worker && !fits(sourceSize))) {
+        p.error = p.worker ? "render_size" : "interactive_filter_unavailable";
+        return false;
+    }
+    if (!p.source.allocate(sourceSize) || !p.output.allocate(processed)
+        || (!p.worker && p.filter == Filter::Fsr && !p.intermediate.allocate(processed))) {
+        return false;
+    }
+    if (p.worker && !p.worker->update(sourceSize, processed, p.filter, p.output.id())) {
+        p.error = p.worker->error();
         return false;
     }
 
-    const KWin::RenderTarget sourceTarget(p.source.framebuffer.get(), target.colorDescription());
+    if (!p.worker || p.worker->canCapture()) {
+        const KWin::RenderTarget sourceTarget(p.source.framebuffer.get(), target.colorDescription());
 #ifdef PICALENS_KWIN_67
-    const KWin::RenderViewport sourceViewport(KWin::RectF(presentation.source), sourceScale, sourceTarget, QPoint());
-    const Damage sourceDamage(KWin::Rect(paintRect(sourceViewport, presentation.source.toAlignedRect())));
+        const KWin::RenderViewport sourceViewport(KWin::RectF(presentation.source), sourceScale, sourceTarget, QPoint());
+        const Damage sourceDamage(KWin::Rect(paintRect(sourceViewport, presentation.source.toAlignedRect())));
 #else
-    const KWin::RenderViewport sourceViewport(presentation.source, sourceScale, sourceTarget);
-    const Damage sourceDamage(paintRect(sourceViewport, presentation.source.toAlignedRect()));
+        const KWin::RenderViewport sourceViewport(presentation.source, sourceScale, sourceTarget);
+        const Damage sourceDamage(paintRect(sourceViewport, presentation.source.toAlignedRect()));
 #endif
-    {
         FramebufferBinding binding(p.source.framebuffer.get());
         state.prepare();
         glViewport(0, 0, sourceSize.width(), sourceSize.height());
@@ -348,14 +658,18 @@ bool GpuPresentation::paint(KWin::EffectWindow *window, const Presentation &pres
         KWin::effects->renderWindow(sourceTarget, sourceViewport, window,
             KWin::Effect::PAINT_WINDOW_TRANSFORMED | KWin::Effect::PAINT_WINDOW_TRANSLUCENT,
             sourceDamage, data);
+        if (p.worker && !p.worker->capture(sourceSize)) {
+            p.error = p.worker->error();
+            return false;
+        }
     }
 
     state.prepare();
     glBindVertexArray(p.vao);
-    if (p.filter == Filter::Fsr) {
+    if (!p.worker && p.filter == Filter::Fsr) {
         p.drawPass(p.upscale, p.source.id(), p.intermediate, processed);
         p.drawPass(p.sharpen, p.intermediate.id(), p.output, processed);
-    } else {
+    } else if (!p.worker) {
         p.drawPass(p.upscale, p.source.id(), p.output, processed);
     }
 
@@ -372,6 +686,9 @@ bool GpuPresentation::paint(KWin::EffectWindow *window, const Presentation &pres
 
     FramebufferBinding binding(target.framebuffer());
     clearGlDamage(target, viewport, damage.intersected(paintRect(viewport, presentation.outputRect)));
+    if (!hasFrame()) {
+        return true;
+    }
     glViewport(0, 0, target.size().width(), target.size().height());
     glEnable(GL_SCISSOR_TEST);
     p.present.use(p.output.id(), processed);

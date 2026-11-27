@@ -17,6 +17,9 @@ mod locale;
 mod native;
 mod preview;
 mod probe;
+mod render_client;
+mod render_device;
+mod render_worker;
 mod session;
 mod settings;
 mod shortcut;
@@ -25,4 +28,5 @@ mod upscale;
 mod viewport;
 
 pub use probe::run as run_probe;
+pub use render_worker::run as run_render_worker;
 pub use standalone::run;

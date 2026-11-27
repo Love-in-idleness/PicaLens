@@ -39,9 +39,10 @@ for target in kwin-debian13 kwin-ubuntu26.10; do
 done
 
 export CARGO_TARGET_DIR="$build_dir/cargo"
-cargo build --locked --release --bin picalens
+cargo build --locked --release --bin picalens --bin picalens-render
 install -Dm755 "$CARGO_TARGET_DIR/release/picalens" "$stage/usr/bin/picalens"
-strip --strip-unneeded "$stage/usr/bin/picalens"
+install -Dm755 "$CARGO_TARGET_DIR/release/picalens-render" "$stage/usr/lib/picalens/picalens-render"
+strip --strip-unneeded "$stage/usr/bin/picalens" "$stage/usr/lib/picalens/picalens-render"
 install -Dm644 data/io.github.LoveInIdleness.PicaLens.desktop \
     "$stage/usr/share/applications/io.github.LoveInIdleness.PicaLens.desktop"
 install -Dm644 data/io.github.LoveInIdleness.PicaLens.png \
@@ -55,12 +56,13 @@ ln -s ../applications/io.github.LoveInIdleness.PicaLens.desktop \
 docs=$stage/usr/share/doc/picalens
 install -Dm644 packaging/copyright "$docs/copyright"
 install -Dm644 src/shaders/LICENSES "$docs/shader-licenses.txt"
+install -Dm644 src/shaders/anime4k/LICENSE "$docs/anime4k/LICENSE"
 host=$(rustc --print host-tuple)
 cargo metadata --locked --format-version 1 --filter-platform "$host" \
     | python3 packaging/rust-notices.py | gzip -n > "$docs/rust-dependencies.txt.gz"
 
 printf 'Source: picalens\n' > "$work/debian/control"
-shlibs=$(cd "$work" && dpkg-shlibdeps -O -e"$stage/usr/bin/picalens")
+shlibs=$(cd "$work" && dpkg-shlibdeps -O -e"$stage/usr/bin/picalens" -e"$stage/usr/lib/picalens/picalens-render")
 depends=${shlibs#shlibs:Depends=}
 if [[ -z $depends || $depends == "$shlibs" ]]; then
     printf 'Could not determine shared library dependencies.\n' >&2

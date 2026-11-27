@@ -22,7 +22,9 @@ Lanczos 3 按预览的物理像素尺寸重采样，适合文字和普通画面�
 
 **FSR 1** 采用 EASU 放大和 RCAS 锐化两个阶段，**SGSR** 采用单阶段的空间放大。两者复用 Gamescope 的 SDR 着色算法。着色器最多放大 2 倍每边，中间图像上限为 3840×2160 等量像素。选择交互全屏时，软件会检查后端和放大尺寸是否支持所选滤镜，无法运行时会给出提示。 [Gamescope 着色器](https://github.com/ValveSoftware/gamescope/tree/7d957c518081c27e95b0f2d3501237abc62bf4f5/src/shaders)
 
-Plasma 6 会话中，兼容的 KWin 后台支持交互全屏，可以点击、滚动和操作键盘。使用 OpenGL 合成时，全屏预设可以同时启用 FSR 1 或 SGSR，原生 Wayland 和 XWayland 窗口均可操作。GNOME 和 Plasma 的「设置」页可修改放大快捷键。在 Plasma 使用交互全屏预设时，快捷键或 `picalens toggle` 直接放大当前活动窗口，再按一次恢复。要手动指定窗口或使用只读预览，请从界面点击「选择窗口」。 [Plasma 构建与验收](docs/kwin-experiment.md)
+**Anime4K（轻量）** 组合高光限制、CNN 画面修复和按倍率启用的 2 倍超分。在放大预设的「渲染显卡」里，可以为 Anime4K、FSR 1 和 SGSR 指定执行滤镜的设备。Plasma 6 需要支持此功能的 OpenGL 后端。提供单窗流的桌面也可以在 Portal 预览中使用。这项选择在下一次放大时生效。 [Anime4K 着色器](https://github.com/bloc97/Anime4K/tree/v4.0.1)
+
+Plasma 6 会话中，兼容的 KWin 后台支持交互全屏，可以点击、滚动和操作键盘。使用 OpenGL 合成时，全屏预设可以启用 GPU 滤镜，原生 Wayland 和 XWayland 窗口均可操作。GNOME 和 Plasma 的「设置」页可修改放大快捷键。在 Plasma 使用交互全屏预设时，快捷键或 `picalens toggle` 直接放大当前活动窗口，再按一次恢复。要手动指定窗口或使用只读预览，请从界面点击「选择窗口」。 [Plasma 构建与验收](docs/kwin-experiment.md)
 
 ### niri 和 Hyprland
 

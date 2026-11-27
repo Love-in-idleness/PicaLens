@@ -18,6 +18,7 @@ use crate::{
     locale::Locale,
     native,
     preview::{self, StopSender},
+    render_client::{self, RenderUpscaler},
     session::{self, Result, Stop, Target},
     settings::{DEFAULT_ID, Filter, Language, Layout, Presentation, Preset, Settings, Theme},
     shortcut::{self, DesktopShortcut},
@@ -522,10 +523,71 @@ impl View {
             Presentation::ALL.iter().map(|item| item.id()),
             index(Presentation::ALL, preset.presentation),
         );
+        let device = adw::ComboRow::builder().title(self.t("render_gpu")).build();
+        device.connect_selected_item_notify(|row| {
+            let title = row
+                .selected_item()
+                .and_downcast::<gtk::StringObject>()
+                .map(|item| item.string());
+            row.set_tooltip_text(title.as_deref());
+        });
+        let saved_device = preset.render_device.clone();
+        let device_ids = Rc::new(RefCell::new(vec![String::new()]));
+        let automatic = self.t("render_gpu_auto");
+        let missing = self.t("render_gpu_saved");
+        let model = gtk::StringList::new(&[&automatic]);
+        if !saved_device.is_empty() {
+            model.append(&format!("{missing} ({saved_device})"));
+            device_ids.borrow_mut().push(saved_device.clone());
+        }
+        device.set_model(Some(&model));
+        device.set_selected(u32::from(!saved_device.is_empty()));
+        device.set_visible(preset.filter.uses_gpu());
+        filter.connect_selected_notify({
+            let device = device.downgrade();
+            move |row| {
+                if let Some(device) = device.upgrade() {
+                    device.set_visible(Filter::ALL[row.selected() as usize].uses_gpu());
+                }
+            }
+        });
+        glib::spawn_future_local({
+            let device = device.downgrade();
+            let ids = device_ids.clone();
+            let unavailable = self.t("render_gpu_list_failed");
+            async move {
+                let result = render_client::devices().await;
+                let Some(device) = device.upgrade() else {
+                    return;
+                };
+                let Ok(choices) = result else {
+                    device.set_subtitle(&unavailable);
+                    return;
+                };
+                let mut ids = ids.borrow_mut();
+                let selected = ids
+                    .get(device.selected() as usize)
+                    .cloned()
+                    .unwrap_or_default();
+                let new_model = gtk::StringList::new(&[&automatic]);
+                ids.truncate(1);
+                for item in choices {
+                    new_model.append(&item.title());
+                    ids.push(item.id);
+                }
+                if !saved_device.is_empty() && !ids.contains(&saved_device) {
+                    new_model.append(&format!("{missing} ({saved_device})"));
+                    ids.push(saved_device);
+                }
+                device.set_model(Some(&new_model));
+                device.set_selected(ids.iter().position(|id| *id == selected).unwrap_or(0) as u32);
+            }
+        });
         group.add(&name);
         for row in [&layout, &filter, &mode] {
             group.add(row);
         }
+        group.add(&device);
         let hint = gtk::Label::builder()
             .label(self.t("preview_only_options"))
             .wrap(true)
@@ -565,6 +627,11 @@ impl View {
                     layout: Layout::ALL[layout.selected() as usize],
                     filter: Filter::ALL[filter.selected() as usize],
                     presentation: Presentation::ALL[mode.selected() as usize],
+                    render_device: device_ids
+                        .borrow()
+                        .get(device.selected() as usize)
+                        .cloned()
+                        .unwrap_or_default(),
                 };
                 let result = view.settings.borrow_mut().save_preset(&id, &preset);
                 match result {
@@ -683,11 +750,16 @@ impl View {
             return Err("interactive_filter_unavailable".into());
         }
         let preview_only = portal_required(preset);
+        let render_worker = preset.uses_render_worker();
+        if render_worker && !preview_only && !is_plasma() {
+            return Err("interactive_gpu_backend".into());
+        }
         if !preview_only && session::interactive_desktop_unsupported() {
             return Err("desktop_interactive_unsupported".into());
         }
         let desktop = native::Desktop::current();
         if !preview_only
+            && !render_worker
             && preset.layout == Layout::Fit
             && let Some(desktop) = desktop
         {
@@ -717,6 +789,9 @@ impl View {
                 reason = stop => return Ok(reason.unwrap_or("application shutdown").into()),
                 backend = async {
                     let Some(backend) = kwin::discover().await? else { return Ok::<_, Box<dyn std::error::Error>>(None) };
+                    if render_worker && !kwin::supports_render_worker(&backend).await? {
+                        return Err("interactive_gpu_backend".into());
+                    }
                     if !kwin::supports_filter(&backend, preset.filter).await? {
                         return Err("interactive_filter_unavailable".into());
                     }
@@ -731,8 +806,11 @@ impl View {
                     self.window.set_visible(false);
                     None
                 };
-                return kwin::magnify(backend, stop, preset.layout, preset.filter, active).await;
+                return kwin::magnify(backend, stop, preset, active).await;
             }
+        }
+        if render_worker && interactive_gpu {
+            return Err("interactive_gpu_backend".into());
         }
         if interactive_gpu {
             return Err("interactive_filter_unavailable".into());
@@ -775,10 +853,26 @@ impl View {
         let started = Instant::now();
         let viewport = Viewport::new(preset.layout, preset.filter);
         let mut upscaler = Upscaler::new(preset.filter)?;
+        let mut render_worker = if preset.uses_render_worker() {
+            viewport.require_scaled();
+            let hint = if preset.render_device.is_empty() {
+                crate::gpu::current_render_node(&viewport.display())
+            } else {
+                None
+            };
+            Some(RenderUpscaler::new(
+                preset.filter,
+                &preset.render_device,
+                hint,
+            )?)
+        } else {
+            None
+        };
         let mut gpu = preset
             .filter
             .uses_gpu()
-            .then(|| GpuUpscaler::new(preset.filter));
+            .then(|| GpuUpscaler::new(preset.filter))
+            .filter(|_| render_worker.is_none());
         viewport.update_property(&[gtk::accessible::Property::Label(&self.t("preview_image"))]);
         let mut toasts = None;
         loop {
@@ -790,6 +884,8 @@ impl View {
                 viewport.set_frame(preview::rgba_texture(pixels.size, &pixels.bytes)?.upcast());
                 if let Some(upscaler) = &mut upscaler {
                     upscaler.set_source(pixels);
+                } else if let Some(worker) = &mut render_worker {
+                    worker.set_source(pixels);
                 } else if let Some(gpu) = &mut gpu {
                     gpu.set_source(pixels);
                 }
@@ -820,6 +916,11 @@ impl View {
                         }
                     }
                 }
+            }
+            if let Some(worker) = &mut render_worker
+                && let Some(frame) = worker.update(viewport.processing_size())?
+            {
+                viewport.set_scaled_frame(frame)?;
             }
             if toasts.is_none() && started.elapsed() > Duration::from_secs(15) {
                 return Err("no_frame".into());
@@ -1019,6 +1120,11 @@ impl View {
                     | "desktop_interactive_unsupported"
                     | "treeland_interactive_unavailable"
                     | "interactive_filter_unavailable"
+                    | "interactive_gpu_backend"
+                    | "render_gpu_missing"
+                    | "render_gpu_driver"
+                    | "render_size"
+                    | "render_worker_failed"
                     | "no_active_window"
                     | "active_window_preset"
                     | "active_window_backend" => error.as_str(),

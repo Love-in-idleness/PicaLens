@@ -6,7 +6,7 @@ use gtk::{gio, glib, prelude::*};
 
 use crate::{
     session::{Result, Stop},
-    settings::{Filter, Layout},
+    settings::{Filter, Layout, Preset},
 };
 
 const SERVICE: &str = "org.kde.KWin";
@@ -77,6 +77,19 @@ pub async fn supports_filter(backend: &Proxy<'_>, filter: Filter) -> Result<bool
     }
 }
 
+pub async fn supports_render_worker(backend: &Proxy<'_>) -> Result<bool> {
+    match backend.call::<_, _, i32>("RenderWorkerVersion", &()).await {
+        Ok(1) => Ok(true),
+        Ok(_) => Ok(false),
+        Err(zbus::Error::MethodError(name, ..))
+            if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+        {
+            Ok(false)
+        }
+        Err(error) => Err(error.into()),
+    }
+}
+
 async fn active_call(
     conn: &gio::DBusConnection,
     method: &str,
@@ -99,14 +112,24 @@ async fn active_call(
 pub async fn magnify(
     backend: Proxy<'_>,
     mut stop: Stop,
-    layout: Layout,
-    filter: Filter,
+    preset: &Preset,
     active: Option<&gio::DBusConnection>,
 ) -> Result<String> {
+    let Preset {
+        layout,
+        filter,
+        render_device,
+        ..
+    } = preset;
     let mut finished = backend.receive_signal("Finished").await?;
     let mut owner = backend.receive_owner_changed().await?;
     let started: bool = if let Some(conn) = active {
-        let (method, args) = if filter.uses_gpu() {
+        let (method, args) = if preset.uses_render_worker() {
+            (
+                "StartActiveWithRenderDevice",
+                (layout.id(), filter.id(), render_device.as_str()).to_variant(),
+            )
+        } else if filter.uses_gpu() {
             (
                 "StartActiveWithFilter",
                 (layout.id(), filter.id()).to_variant(),
@@ -121,6 +144,13 @@ pub async fn magnify(
             }
             Err(error) => return Err(error.into()),
         }
+    } else if preset.uses_render_worker() {
+        backend
+            .call(
+                "StartWithRenderDevice",
+                &(layout.id(), filter.id(), render_device.as_str()),
+            )
+            .await?
     } else if filter.uses_gpu() {
         backend
             .call("StartWithFilter", &(layout.id(), filter.id()))
@@ -163,7 +193,8 @@ pub async fn magnify(
         signal = finished.next().fuse() => {
             let signal = signal.ok_or("PicaLens lost the KWin backend")?;
             let (reason, _): (String, bool) = signal.body().deserialize()?;
-            if reason == "interactive_filter_unavailable" {
+            if matches!(reason.as_str(), "interactive_filter_unavailable" | "render_gpu_missing"
+                | "render_gpu_driver" | "render_size" | "render_worker_failed") {
                 return Err(reason.into());
             }
             Ok(reason)

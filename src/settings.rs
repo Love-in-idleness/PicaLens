@@ -23,14 +23,14 @@ macro_rules! choices {
 }
 
 choices!(Layout { Fit => "fit", Fill => "fill", Stretch => "stretch", Integer => "integer" });
-choices!(Filter { Linear => "linear", Nearest => "nearest", Lanczos => "lanczos", Scale2x => "scale2x", Fsr => "fsr", Sgsr => "sgsr" });
+choices!(Filter { Linear => "linear", Nearest => "nearest", Lanczos => "lanczos", Scale2x => "scale2x", Fsr => "fsr", Sgsr => "sgsr", Anime4k => "anime4k" });
 choices!(Presentation { Fullscreen => "fullscreen", Windowed => "windowed", Preview => "preview" });
 choices!(Language { System => "system", English => "en", Chinese => "zh-CN", Japanese => "ja" });
 choices!(Theme { System => "system", Light => "light", Dark => "dark" });
 
 impl Filter {
     pub fn uses_gpu(self) -> bool {
-        matches!(self, Self::Fsr | Self::Sgsr)
+        matches!(self, Self::Fsr | Self::Sgsr | Self::Anime4k)
     }
 }
 
@@ -40,6 +40,13 @@ pub struct Preset {
     pub layout: Layout,
     pub filter: Filter,
     pub presentation: Presentation,
+    pub render_device: String,
+}
+
+impl Preset {
+    pub fn uses_render_worker(&self) -> bool {
+        self.filter == Filter::Anime4k || (self.filter.uses_gpu() && !self.render_device.is_empty())
+    }
 }
 
 pub struct Settings {
@@ -123,6 +130,7 @@ impl Settings {
             layout: Layout::parse(layout.as_deref().unwrap_or_default()),
             filter: Filter::parse(&value(&self.file, &group, "filter")),
             presentation: Presentation::parse(&value(&self.file, &group, "presentation")),
+            render_device: value(&self.file, &group, "render-device"),
         }
     }
 
@@ -133,6 +141,7 @@ impl Settings {
             file.set_string(&group, "layout", preset.layout.id());
             file.set_string(&group, "filter", preset.filter.id());
             file.set_string(&group, "presentation", preset.presentation.id());
+            file.set_string(&group, "render-device", &preset.render_device);
         })
     }
 
@@ -190,10 +199,13 @@ mod tests {
         std::fs::write(&path, "[scaling]\nlayout=stretch\n").unwrap();
         let mut settings = Settings::open(&path);
         assert_eq!(settings.preset(DEFAULT_ID).layout, Layout::Stretch);
+        assert!(settings.preset(DEFAULT_ID).render_device.is_empty());
         assert_eq!(settings.theme(), Theme::System);
         let preset = Preset {
             name: "村正".into(),
             layout: Layout::Integer,
+            filter: Filter::Anime4k,
+            render_device: "/pci0000:00/0000:00:02.0".into(),
             ..Preset::default()
         };
         settings.save_preset("mine", &preset).unwrap();

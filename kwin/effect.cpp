@@ -66,6 +66,12 @@ public:
         connect(&m_activationTimer, &QTimer::timeout, this, [this] {
             stop("source activation timed out");
         });
+        m_renderPoll.setSingleShot(true);
+        connect(&m_renderPoll, &QTimer::timeout, this, [this] {
+            if (m_presentation) {
+                repaintOutput(m_presentation->outputRect);
+            }
+        });
         connect(effects, &EffectsHandler::windowActivated, this, [this](EffectWindow *active) {
             if (m_presentation && active != m_window) {
                 stop("focus changed");
@@ -153,7 +159,7 @@ public:
                 m_failedPaint = true;
                 QTimer::singleShot(0, this, [this] {
                     if (m_failedPaint) {
-                        stop(m_gpu ? "interactive_filter_unavailable" : "presentation could not be drawn");
+                        stop(m_gpu ? m_gpu->error() : "presentation could not be drawn");
                     }
                 });
             }
@@ -162,7 +168,14 @@ public:
 #ifdef PICALENS_KWIN_67
         repaintSoftwareCursor(target, viewport, damage);
 #endif
+        if (m_gpu && m_gpu->pending() && !m_renderPoll.isActive()) {
+            m_renderPoll.start(8);
+        }
+        if (m_gpu && !m_gpu->hasFrame()) {
+            return;
+        }
         if (!m_firstPaint && !m_failedPaint && damage.intersects(PicaLens::paintRect(viewport, m_presentation->destination))) {
+            finishRenderWait();
             m_firstPaint = true;
             m_input.setPresentation(m_source, m_presentation->outputRect,
                                     m_presentation->destination, m_presentation->source);
@@ -189,7 +202,7 @@ public:
 
     void grabbedKeyboardEvent(QKeyEvent *event) override
     {
-        if (m_selecting && event->type() == QEvent::KeyRelease && event->key() == Qt::Key_Escape) {
+        if ((m_selecting || m_renderGrab) && event->type() == QEvent::KeyRelease && event->key() == Qt::Key_Escape) {
             stop("selection cancelled", true);
         }
     }
@@ -208,9 +221,18 @@ public Q_SLOTS:
     Q_SCRIPTABLE QStringList SupportedFilters() const
     {
         if (effects->isOpenGLCompositing()) {
-            return {QStringLiteral("linear"), QStringLiteral("fsr"), QStringLiteral("sgsr")};
+            QStringList filters{QStringLiteral("linear"), QStringLiteral("fsr"), QStringLiteral("sgsr")};
+            if (PicaLens::GpuPresentation::workerAvailable()) {
+                filters.append(QStringLiteral("anime4k"));
+            }
+            return filters;
         }
         return {QStringLiteral("linear")};
+    }
+
+    Q_SCRIPTABLE int RenderWorkerVersion() const
+    {
+        return effects->isOpenGLCompositing() && PicaLens::GpuPresentation::workerAvailable() ? 1 : 0;
     }
 
     Q_SCRIPTABLE bool StartWithLayout(const QString &layout)
@@ -237,6 +259,21 @@ public Q_SLOTS:
         return selected && effects->isOpenGLCompositing() && startActive(layout, *selected);
     }
 
+    Q_SCRIPTABLE bool StartWithRenderDevice(const QString &layout, const QString &filter, const QString &device)
+    {
+        const auto parsed = parseLayout(layout);
+        const auto selected = parseGpuFilter(filter);
+        return parsed && selected && RenderWorkerVersion() == 1 && device.size() <= 512
+            && startSelection(*parsed, *selected, device);
+    }
+
+    Q_SCRIPTABLE bool StartActiveWithRenderDevice(const QString &layout, const QString &filter, const QString &device)
+    {
+        const auto selected = parseGpuFilter(filter);
+        return selected && RenderWorkerVersion() == 1 && device.size() <= 512
+            && startActive(layout, *selected, device);
+    }
+
     Q_SCRIPTABLE void Stop()
     {
         if (calledFromDBus() && m_owner.watchedServices().contains(message().service())) {
@@ -248,7 +285,7 @@ Q_SIGNALS:
     Q_SCRIPTABLE void Finished(const QString &reason, bool returnToControls);
 
 private:
-    bool startActive(const QString &layout, PicaLens::Filter filter)
+    bool startActive(const QString &layout, PicaLens::Filter filter, const QString &device = {})
     {
         const auto parsed = parseLayout(layout);
         if (!parsed || !canStart()) {
@@ -264,6 +301,7 @@ private:
         m_owner.addWatchedService(message().service());
         m_layout = *parsed;
         m_filter = filter;
+        m_renderDevice = device;
         return start(window);
     }
 
@@ -272,6 +310,7 @@ private:
         switch (filter) {
         case PicaLens::Filter::Fsr: return QStringLiteral("fsr");
         case PicaLens::Filter::Sgsr: return QStringLiteral("sgsr");
+        case PicaLens::Filter::Anime4k: return QStringLiteral("anime4k");
         case PicaLens::Filter::Linear: return QStringLiteral("linear");
         }
         Q_UNREACHABLE_RETURN(QString());
@@ -279,7 +318,7 @@ private:
 
     static std::optional<PicaLens::Filter> parseGpuFilter(const QString &name)
     {
-        for (const auto filter : {PicaLens::Filter::Fsr, PicaLens::Filter::Sgsr}) {
+        for (const auto filter : {PicaLens::Filter::Fsr, PicaLens::Filter::Sgsr, PicaLens::Filter::Anime4k}) {
             if (filterName(filter) == name) {
                 return filter;
             }
@@ -308,7 +347,8 @@ private:
             && !effects->isMouseInterception() && !input()->isSelectingWindow();
     }
 
-    bool startSelection(PicaLens::Layout layout, PicaLens::Filter filter = PicaLens::Filter::Linear)
+    bool startSelection(PicaLens::Layout layout, PicaLens::Filter filter = PicaLens::Filter::Linear,
+                        const QString &device = {})
     {
         if (!canStart() || !effects->grabKeyboard(this)) {
             return false;
@@ -316,6 +356,7 @@ private:
         m_owner.addWatchedService(message().service());
         m_layout = layout;
         m_filter = filter;
+        m_renderDevice = device;
         m_selecting = true;
         effects->startMouseInterception(this, Qt::CrossCursor);
         qInfo("picalens selecting an existing window");
@@ -454,11 +495,26 @@ private:
         m_source = source;
         m_fallbackCursor.setTheme(input()->pointer()->cursorTheme());
         m_presentation = presentation;
-        if (m_filter != PicaLens::Filter::Linear) {
-            m_gpu = std::make_unique<PicaLens::GpuPresentation>(m_filter);
-        }
         source->refOffscreenRendering();
+        if (m_filter != PicaLens::Filter::Linear) {
+            m_gpu = std::make_unique<PicaLens::GpuPresentation>(m_filter, m_renderDevice, [this] {
+                if (m_presentation) {
+                    repaintOutput(m_presentation->outputRect);
+                }
+            });
+            if (!m_gpu->hasFrame()) {
+                m_input.blockOutput(m_presentation->outputRect);
+                m_renderGrab = effects->grabKeyboard(this);
+                if (!m_renderGrab) {
+                    stop("render_worker_failed");
+                    return false;
+                }
+            }
+        }
         connect(window, &EffectWindow::windowDamaged, this, [this] {
+            if (m_gpu) {
+                m_gpu->sourceDamaged();
+            }
             repaintOutput(m_presentation->outputRect);
         });
         connect(window, &EffectWindow::windowFrameGeometryChanged, this, [this] {
@@ -509,6 +565,8 @@ private:
         }
         const QRect repaint = m_presentation->outputRect;
         m_presentation.reset();
+        m_renderPoll.stop();
+        finishRenderWait();
         if (m_gpu) {
             const bool current = effects->makeOpenGLContextCurrent();
             m_gpu.reset();
@@ -535,6 +593,14 @@ private:
         repaintOutput(repaint);
     }
 
+    void finishRenderWait()
+    {
+        if (m_renderGrab) {
+            m_renderGrab = false;
+            effects->ungrabKeyboard();
+        }
+    }
+
     QPointer<EffectWindow> m_window;
     QPointer<EffectWindow> m_pendingActivation;
     QPointer<Window> m_source;
@@ -542,6 +608,7 @@ private:
     QPointer<RenderView> m_paintView;
 #endif
     QTimer m_activationTimer;
+    QTimer m_renderPoll;
     QDBusServiceWatcher m_owner;
     ShapeCursorSource m_fallbackCursor;
     QPointer<CursorSource> m_originalCursor;
@@ -550,11 +617,13 @@ private:
     PicaLensInputFilter m_input;
     PicaLens::Layout m_layout = PicaLens::Layout::Fit;
     PicaLens::Filter m_filter = PicaLens::Filter::Linear;
+    QString m_renderDevice;
     std::unique_ptr<PicaLens::GpuPresentation> m_gpu;
     bool m_registered = false;
     bool m_selecting = false;
     bool m_firstPaint = false;
     bool m_failedPaint = false;
+    bool m_renderGrab = false;
 };
 
 KWIN_EFFECT_FACTORY_SUPPORTED_ENABLED(PicaLensEffect, "metadata.json",

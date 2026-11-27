@@ -26,6 +26,7 @@ public:
     // All rectangles use KWin's global logical coordinates. Enable after
     // painting the source into exactly this picture rectangle.
     void setPresentation(Window *target, const QRectF &output, const QRectF &picture, const QRectF &source);
+    void blockOutput(const QRectF &output);
     void clear();
 
     bool pointerMotion(PointerMotionEvent *event) override;

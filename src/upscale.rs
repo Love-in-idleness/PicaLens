@@ -11,8 +11,8 @@ use crate::{capture::Frame, session::Result, settings::Filter};
 
 pub type Size = (u32, u32);
 
-const MAX_PIXELS: u64 = 3840 * 2160;
-const MAX_EDGE: u32 = 8192;
+pub const MAX_PIXELS: u64 = 3840 * 2160;
+pub const MAX_EDGE: u32 = 8192;
 
 #[derive(Clone)]
 pub struct Pixels {
@@ -108,7 +108,13 @@ impl Upscaler {
 
 pub fn processing_size(filter: Filter, source: Size, target: Size) -> Option<Size> {
     let (w, h) = target;
-    if w == 0 || h == 0 || source == target {
+    if w == 0 || h == 0 {
+        return None;
+    }
+    if filter == Filter::Anime4k {
+        return Some(bounded_size(target, 1.0));
+    }
+    if source == target {
         return None;
     }
     match filter {

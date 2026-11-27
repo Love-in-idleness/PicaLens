@@ -3,21 +3,28 @@
 
 #include "presentation.h"
 
+#include <QString>
+#include <functional>
 #include <memory>
 
 namespace PicaLens
 {
 
-enum class Filter { Linear, Fsr, Sgsr };
+enum class Filter { Linear, Fsr, Sgsr, Anime4k };
 
 class GpuPresentation
 {
 public:
-    explicit GpuPresentation(Filter filter);
+    GpuPresentation(Filter filter, const QString &device, std::function<void()> repaint);
     ~GpuPresentation();
+    static bool workerAvailable();
     bool paint(KWin::EffectWindow *window, const Presentation &presentation,
                const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
                const Damage &damage);
+    void sourceDamaged();
+    bool pending() const;
+    bool hasFrame() const;
+    const char *error() const;
 
 private:
     struct Pipeline;

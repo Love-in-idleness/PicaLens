@@ -123,6 +123,12 @@ void PicaLensInputFilter::clear()
     m_source = {};
 }
 
+void PicaLensInputFilter::blockOutput(const QRectF &output)
+{
+    clear();
+    m_output = output;
+}
+
 bool PicaLensInputFilter::canRoute(SeatInterface *seat) const
 {
     auto *target = m_target.data();
@@ -162,11 +168,11 @@ PicaLensInputFilter::Route PicaLensInputFilter::routePointer(const QPointF &posi
         releaseClaim(false);
         return Route::Desktop;
     }
-    if (!m_target || !containsPoint(m_output, position)) {
+    if (!containsPoint(m_output, position)) {
         releaseClaim(true);
         return Route::Desktop;
     }
-    if (m_waitForButtonsUp || !canRoute(seat)) {
+    if (!m_target || m_waitForButtonsUp || !canRoute(seat)) {
         releaseClaim(false);
         return Route::Blocked;
     }

@@ -22,6 +22,7 @@ mod imp {
         pub(super) scaled: RefCell<Option<CachedTexture>>,
         pub layout: Cell<Layout>,
         pub filter: Cell<Filter>,
+        pub require_scaled: Cell<bool>,
     }
 
     #[glib::object_subclass]
@@ -55,6 +56,10 @@ impl Viewport {
     pub fn set_frame(&self, frame: gdk::Texture) {
         self.imp().frame.replace(Some(frame));
         self.queue_draw();
+    }
+
+    pub fn require_scaled(&self) {
+        self.imp().require_scaled.set(true);
     }
 
     pub fn set_scaled_frame(&self, frame: ScaledFrame) -> Result<()> {
@@ -129,11 +134,12 @@ impl Viewport {
     }
 
     fn scaled_size(&self, source: Size, [_, _, w, h]: [f64; 4], scale: f64) -> Option<Size> {
-        upscale::processing_size(
+        let size = upscale::processing_size(
             self.imp().filter.get(),
             source,
             ((w * scale).round() as u32, (h * scale).round() as u32),
-        )
+        );
+        size.or_else(|| (self.imp().require_scaled.get() && w > 0.0 && h > 0.0).then_some(source))
     }
 
     fn draw(&self, snapshot: &gtk::Snapshot) {
@@ -151,7 +157,7 @@ impl Viewport {
         let [x, y, w, h] = layout;
         let area = graphene::Rect::new(x as f32, y as f32, w as f32, h as f32);
         let filter = match self.imp().filter.get() {
-            Filter::Linear | Filter::Lanczos | Filter::Fsr | Filter::Sgsr => {
+            Filter::Linear | Filter::Lanczos | Filter::Fsr | Filter::Sgsr | Filter::Anime4k => {
                 gsk::ScalingFilter::Linear
             }
             Filter::Nearest | Filter::Scale2x => gsk::ScalingFilter::Nearest,
@@ -159,10 +165,14 @@ impl Viewport {
         let source = size(frame);
         let target = self.scaled_size(source, layout, scale);
         let scaled = self.imp().scaled.borrow();
-        let frame = scaled
+        let scaled = scaled
             .as_ref()
             .filter(|cached| cached.source == source && target == Some(size(&cached.texture)))
-            .map_or(frame, |cached| &cached.texture);
+            .map(|cached| &cached.texture);
+        if self.imp().require_scaled.get() && scaled.is_none() {
+            return;
+        }
+        let frame = scaled.unwrap_or(frame);
         snapshot.push_clip(&clip);
         snapshot.append_scaled_texture(frame, filter, &area);
         snapshot.pop();

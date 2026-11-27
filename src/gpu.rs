@@ -31,6 +31,17 @@ const RCAS_PASS: &str = include_str!("shaders/rcas-pass.glsl");
 
 const SGSR_PASS: &str = include_str!("shaders/sgsr-pass.glsl");
 
+pub(crate) fn filter_sources(filter: Filter) -> Vec<String> {
+    match filter {
+        Filter::Fsr => vec![
+            [FRAGMENT, "#define FSR_EASU_F\n", FSR, EASU_PASS].concat(),
+            [FRAGMENT, "#define FSR_RCAS_F\n", FSR, RCAS_PASS].concat(),
+        ],
+        Filter::Sgsr => vec![[FRAGMENT, SGSR, SGSR_PASS].concat()],
+        _ => Vec::new(),
+    }
+}
+
 pub struct GpuUpscaler {
     filter: Filter,
     pipeline: Option<Pipeline>,
@@ -99,6 +110,13 @@ impl Drop for Current {
     }
 }
 
+pub fn current_render_node(display: &gdk::Display) -> Option<std::path::PathBuf> {
+    let context = display.create_gl_context().ok()?;
+    context.realize().ok()?;
+    let _current = Current::make(&context);
+    crate::render_device::current_node()
+}
+
 struct Pipeline {
     gl: Rc<Gl>,
     programs: Vec<glow::NativeProgram>,
@@ -151,18 +169,11 @@ impl Pipeline {
             limit,
         };
         let gl = &pipeline.gl.functions;
-        match filter {
-            Filter::Fsr => {
-                let easu = [FRAGMENT, "#define FSR_EASU_F\n", FSR, EASU_PASS].concat();
-                pipeline.programs.push(program(gl, &easu)?);
-                let rcas = [FRAGMENT, "#define FSR_RCAS_F\n", FSR, RCAS_PASS].concat();
-                pipeline.programs.push(program(gl, &rcas)?);
-            }
-            Filter::Sgsr => {
-                let shader = [FRAGMENT, SGSR, SGSR_PASS].concat();
-                pipeline.programs.push(program(gl, &shader)?);
-            }
-            _ => return Err("no GPU shader for this filter".into()),
+        for source in filter_sources(filter) {
+            pipeline.programs.push(program(gl, &source)?);
+        }
+        if pipeline.programs.is_empty() {
+            return Err("no GPU shader for this filter".into());
         }
         // All calls use the private, current context. GTK/GSK only sees the finished output.
         unsafe {
@@ -309,7 +320,7 @@ impl Drop for Output {
     }
 }
 
-fn program(gl: &glow::Context, fragment: &str) -> Result<glow::NativeProgram> {
+pub(crate) fn program(gl: &glow::Context, fragment: &str) -> Result<glow::NativeProgram> {
     unsafe {
         let program = gl.create_program()?;
         let result = (|| -> Result<()> {
@@ -342,7 +353,7 @@ fn program(gl: &glow::Context, fragment: &str) -> Result<glow::NativeProgram> {
     }
 }
 
-fn texture(gl: &glow::Context) -> Result<glow::NativeTexture> {
+pub(crate) fn texture(gl: &glow::Context) -> Result<glow::NativeTexture> {
     unsafe {
         let id = gl.create_texture()?;
         gl.bind_texture(glow::TEXTURE_2D, Some(id));
