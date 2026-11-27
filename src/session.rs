@@ -20,6 +20,7 @@ pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
 pub type Stop = oneshot::Receiver<&'static str>;
 pub const PORTAL_CLOSED: &str = "portal session closed";
 const WINDOW_PORTAL_DESKTOPS: &[&str] = &["niri", "Hyprland", "DDE", "Deepin", "Treeland"];
+const UNSUPPORTED_INTERACTIVE_DESKTOPS: &[&str] = &["COSMIC", "Sway", "Denial"];
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum Target {
@@ -29,6 +30,10 @@ pub enum Target {
 
 pub fn portal_desktop() -> bool {
     desktop_matches(WINDOW_PORTAL_DESKTOPS)
+}
+
+pub fn interactive_desktop_unsupported() -> bool {
+    desktop_matches(UNSUPPORTED_INTERACTIVE_DESKTOPS)
 }
 
 pub fn desktop_matches(names: &[&str]) -> bool {
@@ -354,6 +359,16 @@ mod tests {
                 !matches_desktop(desktop, WINDOW_PORTAL_DESKTOPS),
                 "{desktop}"
             );
+        }
+    }
+
+    #[test]
+    fn matches_unsupported_interactive_desktops_by_complete_name() {
+        for desktop in ["COSMIC", "sway", "Denial", "distribution:Cosmic"] {
+            assert!(matches_desktop(desktop, UNSUPPORTED_INTERACTIVE_DESKTOPS));
+        }
+        for desktop in ["", "pop:GNOME", "KDE", "niri", "Hyprland", "DDE", "NotSway"] {
+            assert!(!matches_desktop(desktop, UNSUPPORTED_INTERACTIVE_DESKTOPS));
         }
     }
 

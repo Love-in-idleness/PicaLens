@@ -585,7 +585,9 @@ impl View {
         let preset = self.active_preset();
         let preview_only = portal_required(&preset);
         let desktop = native::Desktop::current();
-        let key = if !preview_only && matches!(desktop, Some(native::Desktop::Treeland)) {
+        let key = if !preview_only && session::interactive_desktop_unsupported() {
+            "desktop_interactive_unsupported"
+        } else if !preview_only && matches!(desktop, Some(native::Desktop::Treeland)) {
             "backend_treeland_in_progress"
         } else if interactive_gpu(&preset) {
             "backend_gpu_auto"
@@ -681,6 +683,9 @@ impl View {
             return Err("interactive_filter_unavailable".into());
         }
         let preview_only = portal_required(preset);
+        if !preview_only && session::interactive_desktop_unsupported() {
+            return Err("desktop_interactive_unsupported".into());
+        }
         let desktop = native::Desktop::current();
         if !preview_only
             && preset.layout == Layout::Fit
@@ -1008,6 +1013,7 @@ impl View {
                     | "gnome_source_lost"
                     | "native_backend_lost"
                     | "native_backend_busy"
+                    | "desktop_interactive_unsupported"
                     | "treeland_interactive_unavailable"
                     | "interactive_filter_unavailable"
                     | "no_active_window"

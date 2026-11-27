@@ -104,6 +104,18 @@ Plasma 另在 1920×1080 @ 150% 通过了 SGSR 与 XWayland 的交互复测。Hy
 
 使用构建产物内置的着色器复测时，XWayland 源窗先后运行 FSR 1、SGSR、线性和 FSR 1。同一静态区域的截图逐像素比较确认三种滤镜产生各自的渲染结果。
 
+### COSMIC、Sway 与 Denial
+
+交互验收要求同一个会话授予所选窗口的流、鼠标和键盘，并能把窗口流的 `mapping_id` 唯一对应到 EIS 绝对坐标区域。进入点击、滚轮、键盘和滤镜测试之前，先用 `picalens-probe --desktop-only` 检查声明的能力，再用 `--experiment` 检查会话授权。
+
+| 会话 | 验证结果 | 交互放大 |
+| --- | --- | --- |
+| COSMIC Epoch 1.11.0 | 发布版源码为单窗流明确设置 `mapping_id: None`，合成器按输出声明 EIS 绝对坐标区域。当前构建环境无法取得发行版二进制包或从 GitLab 获取 Portal 锁定的 PipeWire Rust 依赖，未启动会话实测。 [窗口流源码](https://github.com/pop-os/xdg-desktop-portal-cosmic/blob/f448ddfb296bf7bb23517b24b2f532559a334a1c/src/screencast.rs#L302-L326) · [EIS 区域源码](https://github.com/pop-os/cosmic-comp/blob/8cb1802caada438bb5cc7670dfabdaca5fad0502/src/libei.rs#L29-L48) | 暂不支持 |
+| Sway 1.12，wlr Portal 0.9.0 | Ubuntu 26.10 嵌套 Wayland 会话实测。ScreenCast v5 声明 `0x3`，原生 Wayland 和 XWayland 均取得 Window 类型的 PipeWire 流并持续收到 BGRx 帧。实验探针报告缺少 `org.freedesktop.portal.RemoteDesktop`。Sway 的虚拟鼠标指定 seat 或输出，公开协议没有目标窗口参数。 [Portal 接口声明](https://github.com/emersion/xdg-desktop-portal-wlr/blob/v0.9.0/wlr.portal) · [虚拟输入源码](https://github.com/swaywm/sway/blob/1.12/sway/input/input-manager.c#L398-L431) | 暂不支持 |
+| Denial 0.6.10 | 在 Debian 13 的 QEMU/VirGL 虚拟机中启动官方 amd64 包。Debian 自带的 wlr Portal 0.7.1 仅声明屏幕源 `0x1`，原版 0.9.0 声明屏幕和窗口源 `0x3`。两轮均实测缺少 RemoteDesktop。图形探针和应用在此会话的 GTK 4.18 中启动时崩溃，单窗出帧和界面提示未验收。 [官方发布包](https://github.com/denialwm/denial/releases/tag/v0.6.10) · [Portal 路由](https://github.com/denialwm/denial/blob/v0.6.10/packaging/arch/denial-portals.conf) · [libeis 计划](https://github.com/denialwm/denial/blob/v0.6.10/docs/libeis_support_plan.md) | 暂不支持 |
+
+Sway 会话还验证了 `picalens toggle` 显示当前桌面不支持交互放大，以及从「选择窗口」打开显式只读预设能绘制首帧。三个会话均未进入交互输入命中和 GPU 滤镜验收。
+
 ### Plasma 6 Wayland 验收
 
 | 源窗 | OBS 与探针捕获 | 并排输入 | 全屏覆盖输入 |

@@ -36,6 +36,16 @@ niri 26.04 使用独立 fork 中的交互后台，Hyprland 0.53.3 使用匹配�
 
 DDE Wayland 的交互全屏仍在适配中，相关开发暂缓。实验构建已在虚拟机中验证，发行版自带的 Treeland 仍待验收。系统 Portal 提供窗口采集时，可以使用只读预览。 [实验记录](docs/treeland-experiment.md) · [Treeland 功能讨论](https://github.com/linuxdeepin/treeland/issues/1728)
 
+### COSMIC、Sway 与 Denial
+
+| 原版 Wayland 会话 | 交互放大 | 阻塞原因 |
+| --- | --- | --- |
+| COSMIC Epoch 1.11.0 | 暂不支持 | Portal 单窗流没有用于 EIS 输入定位的 `mapping_id` |
+| Sway 1.12（wlr Portal 0.9.0） | 暂不支持 | 原生 Wayland 和 XWayland 单窗采集均已验证，默认 Portal 没有 RemoteDesktop 接口 |
+| Denial 0.6.10 | 暂不支持 | 官方包使用 wlr Portal 提供屏幕共享，没有 RemoteDesktop 后端 |
+
+在这三个桌面选择交互全屏时，PicaLens 会显示「当前桌面暂不支持交互放大」。如果会话的 ScreenCast Portal 提供单窗流，可以显式选择只读预览。 [验收记录](docs/verification.md#cosmicsway-与-denial)
+
 ### GNOME
 
 GNOME 51 Wayland 可启用随包安装的 PicaLens 扩展。首次安装后重新登录 GNOME，再启用扩展。
