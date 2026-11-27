@@ -98,7 +98,7 @@ Plasma 另在 1920×1080 @ 150% 通过了 SGSR 与 XWayland 的交互复测。Hy
 
 ### DDE Wayland 的 Treeland 0.12.1
 
-从 GitHub 获取 Treeland 0.12.1、dde-wlroots 0.20.2.1 等源码，构建依赖使用 Ubuntu 软件包归档。在 Ubuntu 26.10 虚拟机中启动真实 Treeland，使用 VirGL、OpenGL ES 3.1 以上、640×480 @ 100%。测试会话直接启动合成器，完整 DDM 登录流程与物理显卡性能仍待验收。 [后端与使用](treeland-experiment.md)
+此处结果来自实验构建。Treeland 0.12.1 和 dde-wlroots 0.20.2.1 的基础源码来自 GitHub，构建依赖来自 Ubuntu 软件包归档。在 Ubuntu 26.10 虚拟机中直接启动合成器，使用 VirGL、OpenGL ES 3.1 以上、640×480 @ 100%。完整 DDM 登录流程与物理显卡性能仍待验收。 [后端与使用](treeland-experiment.md)
 
 在 Treeland 会话中选中原生 Wayland 或 XWayland 源窗，两类窗口在 FSR 1 和 SGSR 下均依次收到九个位置的点击、双向滚轮和 A 键按下及释放。黑边的点击和滚轮未送达源窗或观察窗。关闭正在放大的原生 Wayland 窗口后，可以继续选择并放大 XWayland 窗口。XWayland 的 `:0` 已通过 `xdpyinfo -queryExtensions` 确认具有 XWAYLAND 扩展。
 
@@ -110,11 +110,26 @@ Plasma 另在 1920×1080 @ 150% 通过了 SGSR 与 XWayland 的交互复测。Hy
 
 | 会话 | 验证结果 | 交互放大 |
 | --- | --- | --- |
-| COSMIC Epoch 1.11.0 | 发布版源码为单窗流明确设置 `mapping_id: None`，合成器按输出声明 EIS 绝对坐标区域。当前构建环境无法取得发行版二进制包或从 GitLab 获取 Portal 锁定的 PipeWire Rust 依赖，未启动会话实测。 [窗口流源码](https://github.com/pop-os/xdg-desktop-portal-cosmic/blob/f448ddfb296bf7bb23517b24b2f532559a334a1c/src/screencast.rs#L302-L326) · [EIS 区域源码](https://github.com/pop-os/cosmic-comp/blob/8cb1802caada438bb5cc7670dfabdaca5fad0502/src/libei.rs#L29-L48) | 暂不支持 |
+| COSMIC Epoch 1.11.0 | 发布版为单窗流设置 `mapping_id: None`，合成器按输出声明 EIS 绝对坐标区域。后续会话实测见下文。 [窗口流源码](https://github.com/pop-os/xdg-desktop-portal-cosmic/blob/f448ddfb296bf7bb23517b24b2f532559a334a1c/src/screencast.rs#L302-L326) · [EIS 区域源码](https://github.com/pop-os/cosmic-comp/blob/8cb1802caada438bb5cc7670dfabdaca5fad0502/src/libei.rs#L29-L48) | 暂不支持 |
 | Sway 1.12，wlr Portal 0.9.0 | Ubuntu 26.10 嵌套 Wayland 会话实测。ScreenCast v5 声明 `0x3`，原生 Wayland 和 XWayland 均取得 Window 类型的 PipeWire 流并持续收到 BGRx 帧。实验探针报告缺少 `org.freedesktop.portal.RemoteDesktop`。Sway 的虚拟鼠标指定 seat 或输出，公开协议没有目标窗口参数。 [Portal 接口声明](https://github.com/emersion/xdg-desktop-portal-wlr/blob/v0.9.0/wlr.portal) · [虚拟输入源码](https://github.com/swaywm/sway/blob/1.12/sway/input/input-manager.c#L398-L431) | 暂不支持 |
 | Denial 0.6.10 | 在 Debian 13 的 QEMU/VirGL 虚拟机中启动官方 amd64 包。Debian 自带的 wlr Portal 0.7.1 仅声明屏幕源 `0x1`，原版 0.9.0 声明屏幕和窗口源 `0x3`。两轮均实测缺少 RemoteDesktop。图形探针和应用在此会话的 GTK 4.18 中启动时崩溃，单窗出帧和界面提示未验收。 [官方发布包](https://github.com/denialwm/denial/releases/tag/v0.6.10) · [Portal 路由](https://github.com/denialwm/denial/blob/v0.6.10/packaging/arch/denial-portals.conf) · [libeis 计划](https://github.com/denialwm/denial/blob/v0.6.10/docs/libeis_support_plan.md) | 暂不支持 |
 
-Sway 会话还验证了 `picalens toggle` 显示当前桌面不支持交互放大，以及从「选择窗口」打开显式只读预设能绘制首帧。三个会话均未进入交互输入命中和 GPU 滤镜验收。
+Sway 会话还验证了 `picalens toggle` 显示当前桌面不支持交互放大，以及从「选择窗口」打开显式只读预设能绘制首帧。
+
+### 原版桌面交互复测
+
+虚拟输出试验把现有测试窗口临时移到新输出，再从实体输出的全屏预览操作。需要同时验证两类窗口的输入命中、焦点隔离和原窗恢复，才进入线性、FSR 1 和 SGSR 的完整验收。
+
+| 原版会话 | 复测结果 |
+| --- | --- |
+| GNOME Shell 和 Mutter 51.0 | Portal 同时授予虚拟输出流、鼠标和键盘，流的 `mapping_id` 与 EIS 的 800×600 区域匹配。等 PipeWire 完成格式协商后连接 EIS，原生 Wayland 和 XWayland 原窗各命中第 5 个按钮。两次点击都把焦点从全屏预览切到虚拟输出的原窗。结束 XWayland 试验后输出被回收，窗口回到实体输出，位置由 `(240, 116)` 变为 `(240, 100)`。 [虚拟输出接口](https://github.com/GNOME/mutter/blob/51.0/data/dbus-interfaces/org.gnome.Mutter.ScreenCast.xml#L158-L199) |
+| Sway 1.12 | QEMU/VirGL 的 DRM 会话可以创建和回收虚拟输出，也可以把窗口移入该输出。临时座席向 XWayland 测试窗送达点击、滚轮和按键。原生 GTK 4.24 测试窗看到新的 `wl_seat` 通告，未绑定该座席，也未收到样本输入。 [虚拟输入实现](https://github.com/swaywm/sway/blob/1.12/sway/input/input-manager.c#L398-L448) |
+| niri 26.04 | 原版 DRM 会话的 ScreenCast v5 声明 `0x7`。RemoteDesktop v2 的设备类型为 `0x0`，交互探针在申请指针前停止。原版 IPC 提供移窗命令，虚拟输出和 RemoteDesktop 仍有上游跟踪项。 [RemoteDesktop PR](https://github.com/niri-wm/niri/pull/1966) · [虚拟输出讨论](https://github.com/niri-wm/niri/discussions/714) |
+| DDE Treeland 0.12.1 | 原版 Treeland、dde-wlroots 0.20.2.1 和 DDE Portal 6.2.1 从上游源码构建。QEMU/VirGL 的 DRM 会话中，原生 Wayland 和 XWayland 测试窗均成功映射。ScreenCast v5 声明 `0x3`。Portal 前端根据 `dde.portal` 提供 RemoteDesktop v2，设备类型为 `0x0`。D-Bus 实测 DDE 的 Wayland 后端没有导出 RemoteDesktop，交互探针在申请指针前停止。完整 DDM 登录未验收，DDE 仍在适配中。 [Portal 声明](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/6.2.1/misc/dde.portal) · [Wayland 接口注册](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/6.2.1/src/wayland/portalwaylandcontext.cpp) |
+| COSMIC Epoch 1.11.0 | 使用与发布版提交匹配的原版二进制启动嵌套会话。Portal 同时授予窗口流、鼠标和键盘，原生 Wayland 和 XWayland 单窗流均持续出帧。两次选窗的 `mapping_id` 都为空，交互探针拒绝注入输入。公开窗口几何接口可用于坐标换算，发布版缺少可单独承载原窗口的软件虚拟输出。 [单窗流实现](https://github.com/pop-os/xdg-desktop-portal-cosmic/blob/f448ddfb296bf7bb23517b24b2f532559a334a1c/src/screencast.rs#L302-L326) · [虚拟输出讨论](https://github.com/pop-os/cosmic-comp/issues/2878) |
+| Denial 0.6.10 | Debian 13 的 QEMU/VirGL 会话中，wlr Portal 0.9.0 声明窗口源，RemoteDesktop 接口仍缺失。`weston-simple-shm` 收到配置并持续提交原生 Wayland 缓冲区，XWayland 测试窗确认映射。原生 GTK 4.18 测试窗和 PicaLens 探针仍在启动时崩溃，应用内单窗出帧未验收。 [官方发布包](https://github.com/denialwm/denial/releases/tag/v0.6.10) |
+
+在缺少兼容后端的 GNOME 和 niri 会话中，通过「选择窗口」启动线性等比全屏，均验证应用报告「当前桌面暂不支持交互放大」。要使用现有的 ScreenCast 采集路径，可以选择窗口化等只读预设。
 
 ### Plasma 6 Wayland 验收
 

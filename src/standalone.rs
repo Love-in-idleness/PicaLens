@@ -756,6 +756,9 @@ impl View {
         if target == Target::Active {
             return Err("active_window_backend".into());
         }
+        if !preview_only && (is_gnome() || matches!(desktop, Some(native::Desktop::Niri))) {
+            return Err("desktop_interactive_unsupported".into());
+        }
         self.backend.set_subtitle(&self.t("backend_portal"));
         self.window.set_visible(false);
         diagnostic!("picalens backend=portal mode=view-only");

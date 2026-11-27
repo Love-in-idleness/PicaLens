@@ -28,6 +28,8 @@ Plasma 6 会话中，兼容的 KWin 后台支持交互全屏，可以点击、�
 
 niri 26.04 使用独立 fork 中的交互后台，Hyprland 0.53.3 使用匹配的后台组件。两者都支持等比全屏，可选线性、FSR 1 和 SGSR。原生 Wayland 和 XWayland 的原窗口输入均已在隔离会话中验证。 [niri 后端](docs/niri-experiment.md) · [Hyprland 后端](docs/hyprland-experiment.md)
 
+原版 niri 26.04 暂不支持交互放大，可选择窗口化等只读预设。 [原版桌面复测](docs/verification.md#原版桌面交互复测)
+
 只读预览使用 ScreenCast Portal 选窗和 PipeWire 单窗流。niri 会话使用 `xdg-desktop-portal-gnome`，Hyprland 会话使用 `xdg-desktop-portal-hyprland`。Hyprland 旧版选窗器若显示多个来源标签，请切换到 **Window** 再选择应用。 [验收记录](docs/verification.md#niri-与-hyprland-单窗放大) · [niri 采集文档](https://niri-wm.github.io/niri/Screencasting.html) · [Hyprland Portal 文档](https://wiki.hypr.land/hypr-ecosystem/user/xdg-desktop-portal-hyprland/)
 
 `picalens toggle` 打开选窗器，再按一次结束放大。niri 的 `binds` 中可添加 `Mod+F8 { spawn "picalens" "toggle"; }`。使用 Hyprlang 配置的 Hyprland 可添加 `bind = SUPER, F8, exec, picalens toggle`，使用 Lua 配置的版本可将同一命令绑定到执行调度器。
@@ -40,11 +42,11 @@ DDE Wayland 的交互全屏仍在适配中，相关开发暂缓。实验构建�
 
 | 原版 Wayland 会话 | 交互放大 | 阻塞原因 |
 | --- | --- | --- |
-| COSMIC Epoch 1.11.0 | 暂不支持 | Portal 单窗流没有用于 EIS 输入定位的 `mapping_id` |
-| Sway 1.12（wlr Portal 0.9.0） | 暂不支持 | 原生 Wayland 和 XWayland 单窗采集均已验证，默认 Portal 没有 RemoteDesktop 接口 |
+| COSMIC Epoch 1.11.0 | 暂不支持 | 实测可同时获得单窗流和输入权限，单窗流缺少 EIS 定位所需的 `mapping_id` |
+| Sway 1.12（wlr Portal 0.9.0） | 暂不支持 | 两类窗口均可采集。虚拟输出试验中，原生 GTK 窗口没有绑定临时座席 |
 | Denial 0.6.10 | 暂不支持 | 官方包使用 wlr Portal 提供屏幕共享，没有 RemoteDesktop 后端 |
 
-在这三个桌面选择交互全屏时，PicaLens 会显示「当前桌面暂不支持交互放大」。如果会话的 ScreenCast Portal 提供单窗流，可以显式选择只读预览。 [验收记录](docs/verification.md#cosmicsway-与-denial)
+在这三个桌面选择交互全屏时，PicaLens 会显示「当前桌面暂不支持交互放大」。如果会话的 ScreenCast Portal 提供单窗流，可以显式选择只读预览。 [验收记录](docs/verification.md#原版桌面交互复测)
 
 ### GNOME
 
@@ -54,7 +56,7 @@ GNOME 51 Wayland 可启用随包安装的 PicaLens 扩展。首次安装后重�
 gnome-extensions enable picalens@love-in-idleness.github.io
 ```
 
-使用全屏预设并从 Shell 选窗后，鼠标可直接点击和滚动。Esc 或切换快捷键恢复原窗。扩展直接支持原生 Wayland 窗口，包括使用 Wine Wayland 驱动的游戏。XWayland 交互需要下文的可选组件。窗口化、整数倍和最近邻使用 Portal 只读预览。
+使用全屏预设并从 Shell 选窗后，鼠标可直接点击和滚动。Esc 或切换快捷键恢复原窗。扩展直接支持原生 Wayland 窗口，包括使用 Wine Wayland 驱动的游戏。XWayland 交互需要下文的可选组件。窗口化、整数倍和最近邻使用 Portal 只读预览。扩展不可用时，可显式选择 Portal 只读预览。
 
 #### GNOME 的 XWayland 交互
 
