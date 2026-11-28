@@ -1,10 +1,170 @@
-# 0.0.1 桌面技术验证
+# PicaLens 技术验证手册与实测记录
 
-当前验收目标为 Plasma 6 Wayland。用原生 Wayland 源窗和 XWayland 源窗各做一轮，独立 X11 会话不纳入验收。启动前确认当前桌面为 KDE、会话类型为 Wayland、KWin 启用了 OpenGL 合成，且 XWayland 可用。每轮记录 KWin、XWayland、Portal 后端、PipeWire 和 OBS 的版本，以及显示器分辨率、刷新率和缩放比例。若桌面提供 100% 和 150% 缩放，两种设置分别记录。
+本文档包含两部分：
+1. **实测结果记录**：按特性与桌面汇总当前已完成和待验证的实测结论。
+2. **通用 Portal / EIS 验证手册**：用于复现 0.0.1 阶段开始的 OBS 遮挡捕获、PipeWire 单窗流与 RemoteDesktop/EIS 输入命中实验。
 
-可以用 `qdbus6 org.kde.KWin /KWin supportInformation` 记录 KWin 的合成后端和输出信息。
+---
 
-在仓库目录构建后，从不同终端启动所测源窗、观察窗和探针。命令以原生 Wayland 并排为例。切换源窗模式、布局或缩放时使用单独的日志目录。
+## 一、实测结果记录
+
+### 渲染显卡与 Anime4K
+
+- **环境**：Ubuntu 26.10 虚拟机、KWin 6.7.5（DRM + VirGL 虚拟渲染节点 `/dev/dri/renderD128`，底层运行于宿主机 llvmpipe）。
+- **交互验收**：在 `1280×768 @ 100%` 与 `1280×960 @ 150%` 下，FSR 1、SGSR、Anime4K 与原生 Wayland / XWayland 的全部 12 轮均通过九点点击、滚轮、A 键与退出恢复；100% 缩放的 6 轮同时通过黑边隔离。
+  > 注：初次 Anime4K 原生 Wayland 试验因虚拟机 Libinput 计时过慢告警导致前两次点击漏投，拉开点击间隔复测后依序命中 1–9。
+- **画质一致性对照**：在 Mesa 上使用固定 `16×12 → 32×24` RGB 测试图，对比 PicaLens Anime4K 与 `mpv 0.41.0`（相同 Anime4K v4.0.1 上游着色器链），两者方向与尺寸完全一致，8-bit RGB 各通道最大差值为 `1`。
+- **Portal 预览与设备持久化**：
+  - 在 KDE Portal 选窗授权原生 Wayland 窗口后，PipeWire 持续提供 `800×600` BGRx 单窗帧，Anime4K 在显式选中的 `renderD128` 上正常出帧且点击预览不会误投原窗。
+  - 在预设中先后保存「自动」与 PCI 设备 `0000:00:01.0`，KWin 日志确认 Anime4K 使用对应 `renderD128`。
+- **异常与兼容验证**：
+  - 指定不存在的设备或放大时移走虚拟渲染节点均返回 `render_gpu_missing`；强制结束渲染进程返回 `render_worker_failed`；三轮退出后源窗持续运行，节点恢复后可重新枚举。
+  - 切回旧版 KWin 后端时，新应用对 Anime4K 全屏报告 `interactive_gpu_backend`；移除预设中的显卡键并切回 FSR 1 后，旧版后端可从原入口正常绘制。
+  - 单个 `.deb` 包已在 Debian 13 与 Ubuntu 26.10 隔离环境安装，分别自动匹配 KWin 6.3.6 与 6.7.5 后端。
+- **独立渲染进程耗时基准**（VirGL / llvmpipe 软件回读，预热 1 帧后统计 3 帧）：
+
+| 滤镜 | 720p → 1080p | 1080p → 2160p |
+| --- | --- | --- |
+| FSR 1 | 157.8 ms（6.10 fps） | 637.4 ms（1.60 fps） |
+| SGSR | 112.5 ms（8.98 fps） | 393.5 ms（2.55 fps） |
+| Anime4K | 551.8 ms（1.81 fps） | 1102.9 ms（0.91 fps） |
+
+- **待验收**：真实双 GPU 交替选卡、拔卡恢复与物理显卡性能。
+
+---
+
+### FSR 1 与 SGSR 交互全屏
+
+各组测试均确认画面经所选滤镜渲染（截图对比覆盖线性与两种滤镜差异），并依序验证九点点击、滚轮、A 键及留边隔离：
+
+| 测试会话 | 原生 Wayland | XWayland |
+| --- | --- | --- |
+| Plasma 6（KWin 6.7.5，VirGL，1280×768 @ 100%） | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
+| niri 26.04（嵌套 OpenGL ES，1280×768 @ 100%） | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
+| Hyprland 0.53.3（VirGL，640×480 @ 100%） | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
+
+补充验证：Plasma 另在 `1920×1080 @ 150%` 通过 SGSR + XWayland 交互复测；Hyprland 另确认原窗打开测试弹窗时自动结束放大且焦点留在弹窗。详见 [Plasma 记录](kwin-experiment.md) · [niri 记录](niri-experiment.md) · [Hyprland 记录](hyprland-experiment.md)。
+
+---
+
+### niri 与 Hyprland 单窗放大
+
+环境：Ubuntu 26.04 虚拟机（QEMU virtio GPU + VirGL），合成器经虚拟 DRM 输出，PicaLens 消费 Portal 授权的 PipeWire 节点（日志与截图存放在 `/workspace/scratch/picalens-lab/desktop-vm/`）。
+
+| 会话 | 原生 Wayland 源窗 | XWayland 源窗 | 退出与恢复 |
+| --- | --- | --- | --- |
+| **niri 26.04**（GNOME Portal 50） | 持续接收 BGRx DMA-BUF 帧，FSR 1 启用；源窗由 `538×786` 缩放至 `590×470` 后继续出帧 | 持续接收 `540×420` DMA-BUF 帧，FSR 1 启用，F11 切换预览模式 | `Super+F8` 停止预览；关闭源窗自动结束 Portal 会话 |
+| **Hyprland 0.53.3**（Hyprland Portal 1.3.11） | 持续接收 `560×440` BGRx DMA-BUF 帧，SGSR 启用 | 持续接收 `560×440` BGRx DMA-BUF 帧，SGSR 启用 | `picalens toggle` 结束预览并重新选窗；选中整屏在打开 PipeWire 流前被拒绝 |
+
+> **兼容性说明**：旧版 Hyprland ScreenCast 私有接口 v3 错移了流结果的 `source_type`（[v1.3.11 源码](https://github.com/hyprwm/xdg-desktop-portal-hyprland/blob/v1.3.11/src/portals/Screencopy.cpp)），新版已修正为标准编号（[v1.4.0 源码](https://github.com/hyprwm/xdg-desktop-portal-hyprland/blob/v1.4.0/src/portals/Screencopy.cpp)）。PicaLens 在识别到旧版后端时会按旧编号解析窗口流。
+
+---
+
+### niri 26.04 原窗口交互
+
+带补丁的 niri 嵌套运行于 QEMU/VirGL 的 niri Wayland 会话，从 `picalens toggle` 选窗：
+- 原生 Wayland 与 XWayland（`:1`）源窗均依序收到 1–9 点击、滚轮与 A 键按下/释放。
+- 黑边点击/滚轮未送达源窗，观察窗零误投。
+- `Esc`、切走焦点与选窗期间再次 `toggle` 均验证通过（日志见 `/workspace/scratch/picalens-lab/desktop-vm/`）。详见 [niri 构建与试用](niri-experiment.md)。
+
+---
+
+### Hyprland 0.53.3 原窗口交互
+
+在 QEMU/VirGL 的 Hyprland `0.53.3+ds-4` 会话中加载后台插件，分别通过界面 **「选择窗口」** 与 `toggle` 启动（100% 输出缩放）：
+- 原生 Wayland 与 XWayland 源窗均依序收到 1–9 点击、双向滚轮与 A 键。
+- 黑边输入未送达源窗，观察窗零误投。
+- `Esc`、再次 `toggle`、关闭源窗与切换焦点均正常结束放大。详见 [Hyprland 构建与试用](hyprland-experiment.md)。
+
+---
+
+### DDE Wayland 的 Treeland 0.12.1
+
+- **环境**：基于 GitHub 上游源码构建的 Treeland 0.12.1 与 dde-wlroots 0.20.2.1，在 Ubuntu 26.10 虚拟机中直接启动合成器（VirGL、OpenGL ES ≥ 3.1、`640×480 @ 100%`）。完整 DDM 登录流程与物理显卡性能待验收。详见 [Treeland 后端与使用](treeland-experiment.md)。
+- **输入验收**：原生 Wayland 与 XWayland（`:0`，经 `xdpyinfo -queryExtensions` 确认 `XWAYLAND` 扩展）在 FSR 1 与 SGSR 下均通过九点点击、双向滚轮、A 键按下/释放与黑边隔离；关闭正在放大的原生 Wayland 窗口后，可继续选择并放大 XWayland 窗口。
+- **滤镜复测**：XWayland 源窗依次运行 FSR 1 → SGSR → 线性 → FSR 1，静态区域逐像素对比确认三种滤镜输出各不相同。
+
+---
+
+### COSMIC、Sway 与 Denial
+
+交互验收前提：同一会话同时授予所选窗口的流、指针与键盘权限，且窗口流 `mapping_id` 可唯一映射到 EIS 绝对坐标区域。验证顺序为先 `picalens-probe --desktop-only` 再 `--experiment`。
+
+| 会话 | 验证结果 | 交互放大 |
+| --- | --- | --- |
+| **COSMIC Epoch 1.11.0** | 单窗流设置 `mapping_id: None`，合成器按输出声明 EIS 区域 · [窗口流源码](https://github.com/pop-os/xdg-desktop-portal-cosmic/blob/f448ddfb296bf7bb23517b24b2f532559a334a1c/src/screencast.rs#L302-L326) · [EIS 源码](https://github.com/pop-os/cosmic-comp/blob/8cb1802caada438bb5cc7670dfabdaca5fad0502/src/libei.rs#L29-L48) | 暂不支持 |
+| **Sway 1.12**（wlr Portal 0.9.0） | Ubuntu 26.10 嵌套会话实测：ScreenCast v5 声明 `0x3`，两类源窗均可取得 Window PipeWire 流并持续输出 BGRx 帧；但缺少 `org.freedesktop.portal.RemoteDesktop`，公开虚拟指针协议无目标窗口参数 · [wlr.portal](https://github.com/emersion/xdg-desktop-portal-wlr/blob/v0.9.0/wlr.portal) · [Sway 源码](https://github.com/swaywm/sway/blob/1.12/sway/input/input-manager.c#L398-L431) | 暂不支持 |
+| **Denial 0.6.10** | Debian 13 QEMU/VirGL 官方 amd64 包实测：Debian 自带 wlr Portal 0.7.1 仅声明屏幕源 `0x1`，原版 0.9.0 声明 `0x3`；两轮均缺少 RemoteDesktop。GTK 4.18 下图形探针与应用启动崩溃，单窗出帧未验收 · [发布包](https://github.com/denialwm/denial/releases/tag/v0.6.10) · [Portal 路由](https://github.com/denialwm/denial/blob/v0.6.10/packaging/arch/denial-portals.conf) · [libeis 计划](https://github.com/denialwm/denial/blob/v0.6.10/docs/libeis_support_plan.md) | 暂不支持 |
+
+> Sway 会话已额外验证：`picalens toggle` 正确提示当前桌面不支持交互放大；从 **「选择窗口」** 使用显式只读预设可正常绘制首帧。
+
+---
+
+### 原版桌面交互复测
+
+通过虚拟输出试验（将测试窗口临时移至新建虚拟输出，从实体输出全屏预览操作）复测各原版桌面；需同时验证两类窗口的输入命中、焦点隔离与原窗恢复后，才进入滤镜完整验收。
+
+| 原版会话 | 复测结果 |
+| --- | --- |
+| **GNOME Shell / Mutter 51.0** | Portal 同时授予虚拟输出流、鼠标与键盘，`mapping_id` 与 EIS `800×600` 区域匹配；PipeWire 协商完成后连接 EIS，两类原窗各命中第 5 按钮，但点击会将焦点从全屏预览切往虚拟输出原窗；回收输出后 XWayland 窗口回到实体输出且位置由 `(240, 116)` 变为 `(240, 100)` · [虚拟输出接口](https://github.com/GNOME/mutter/blob/51.0/data/dbus-interfaces/org.gnome.Mutter.ScreenCast.xml#L158-L199) |
+| **Sway 1.12** | QEMU/VirGL DRM 会话可创建/回收虚拟输出并移入窗口；临时座席可向 XWayland 窗送达点击、滚轮与按键，但原生 GTK 4.24 测试窗未绑定新 `wl_seat`、未收到输入 · [虚拟输入实现](https://github.com/swaywm/sway/blob/1.12/sway/input/input-manager.c#L398-L448) |
+| **niri 26.04** | ScreenCast v5 声明 `0x7`，RemoteDesktop v2 设备类型为 `0x0`，探针在申请指针前停止。原版 IPC 支持移窗，虚拟输出与 RemoteDesktop 仍在上游推进 · [RemoteDesktop PR](https://github.com/niri-wm/niri/pull/1966) · [虚拟输出讨论](https://github.com/niri-wm/niri/discussions/714) |
+| **DDE Treeland 0.12.1** | 上游源码构建的 Treeland + dde-wlroots 0.20.2.1 + DDE Portal 6.2.1 在 QEMU/VirGL DRM 会话中两类测试窗正常映射；ScreenCast v5 声明 `0x3`，RemoteDesktop v2 设备类型为 `0x0`（D-Bus 实测 Wayland 后端未导出 RemoteDesktop）。完整 DDM 登录待验收 · [dde.portal](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/6.2.1/misc/dde.portal) · [接口注册](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/6.2.1/src/wayland/portalwaylandcontext.cpp) |
+| **COSMIC Epoch 1.11.0** | 嵌套会话同时授予单窗流、鼠标与键盘且两类单窗流持续出帧，但 `mapping_id` 为空，探针拒绝注入输入；发布版缺少可单独承载原窗的软件虚拟输出 · [单窗流实现](https://github.com/pop-os/xdg-desktop-portal-cosmic/blob/f448ddfb296bf7bb23517b24b2f532559a334a1c/src/screencast.rs#L302-L326) · [虚拟输出讨论](https://github.com/pop-os/cosmic-comp/issues/2878) |
+| **Denial 0.6.10** | Debian 13 QEMU/VirGL 会话下 wlr Portal 0.9.0 声明窗口源但仍缺 RemoteDesktop；`weston-simple-shm` 与 XWayland 测试窗可映射，原生 GTK 4.18 测试窗与探针启动崩溃 · [发布包](https://github.com/denialwm/denial/releases/tag/v0.6.10) |
+
+> 在缺少兼容后端的 GNOME 与 niri 会话中，从 **「选择窗口」** 启动线性等比全屏均已确认正确提示「当前桌面暂不支持交互放大」；如需使用 ScreenCast 采集路径，应显式选择窗口化等只读预设。
+
+---
+
+### 历史里程碑验收摘要（0.0.4 – 0.0.7）
+
+- **0.0.4 菜单、缩放与多语言**：
+  - GNOME 51 实机（`1920×1200 @ 150%`）：《村正》窗口流裁剪区域 `1545×912`（线性 DMA-BUF），全屏预览映射 `1280×800` 逻辑像素，持续出帧后 `Esc` 返回菜单；隔离会话验证等比适应与裁剪铺满截图（均为 `1920×1200` PNG）。GNOME 51 组合会话在 100% 隔离与 150% 实机均未通过输入验收，只读预览正常。
+  - KWin 6.7.5 隔离会话（`1280×800`）：新后端公布 `fit` / `stretch` / `fill`，裁剪铺满映射 `800×500` 源矩形至全屏，中心按钮与 A 键命中通过。
+  - Gamescope `3.16.24`：通过 PicaLens 界面从含中文和空格的路径启动 Wine 测试程序，窗口正常映射并响应鼠键。中/英/日三语目录一致性与 CLI 文案检查通过。
+- **0.0.5 GNOME 原生 Wayland 交互**：
+  - GNOME Shell / Mutter `51.0` 隔离会话（`1920×1200`，100% 与 150% 缩放）：Shell 直接变换窗口演员、Mutter 处理命中，通过九点点击、滚轮、黑边隔离、`Esc` 恢复与 `picalens toggle`；扩展禁用后自动回退 Portal；未授权 D-Bus 调用返回 `AccessDenied`。
+  - 150% 缩放下通过 Wine Wayland 运行《村正》（`Muramasa_chs.exe`，配合隔离 PipeWire 空音频输出），放大期间可正常点击进入「设定画面」并返回标题；强制结束客户端后扩展自动恢复窗口与顶栏，游戏进程不受影响。
+- **0.0.6 GNOME XWayland 交互**：
+  - Ubuntu Mutter `51.0-1ubuntu3` 隔离会话（`1920×1200`，100% 与 150% 缩放）：加载反算坐标补丁后（[Mutter 源码](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/wayland/meta-xwayland-surface.c)），XWayland 测试窗通过九点点击、滚轮、普通按键、黑边隔离与 `Esc` 恢复；版本不符时自动回退系统库；同会话兼容原生 Wayland 选窗；150% 缩放下 `winex11.drv` 运行《村正》复测通过。
+- **0.0.7 快捷键直接放大活动窗口**：
+  - GNOME 51 与 KWin 6.7.5 隔离会话通过 `Ctrl+Super+Z` 均可直接放大原生 Wayland 与 XWayland 活动窗口、命中中心按钮并再次按键恢复；PicaLens 自身聚焦时正确提示无支持窗口；未持有应用名的 D-Bus 调用被拒绝。
+
+---
+
+### 早期基线对比（Plasma 6.3.6 vs GNOME 50.1）
+
+早期原生 Wayland 对比实验记录（证据目录：`/workspace/scratch/picalens-lab/evidence-plasma/`、`/workspace/scratch/picalens-gnome-lab/evidence-gnome/`、`/workspace/scratch/picalens-lab/evidence-xwayland/`）：
+- **Plasma 6**：KWin 6.3.6（嵌套无 DRM，QPainter）、KDE Portal 6.3.5、xdg-desktop-portal 1.20.3、PipeWire 1.4.2、OBS 30.2.3.1-3、XWayland 24.1.6。
+- **GNOME 50**：Shell/Mutter 50.1（Mutter DevKit `1280×800 @ 100%`）、GNOME Portal 50.0、xdg-desktop-portal 1.21.1、PipeWire 1.6.2、OBS 32.1.0。
+
+| 观测项 | Plasma 6（6.3.6 QPainter） | GNOME 50（50.1） |
+| --- | --- | --- |
+| Portal 能力声明 | ScreenCast v5（`0x3`）、RemoteDesktop v2（`0x7`）、GlobalShortcuts v1 | ScreenCast v5（`0x7`）、RemoteDesktop v2（`0x7`）、GlobalShortcuts v1 |
+| OBS 可见 / 遮挡 / 最小化 / 切工作区 | 均阻塞于 KWin `OpenGL compositing is required for screencasting` | 可见（172→187）、完全遮挡（88→105）、最小化（189→205）、切工作区（271→286）均持续出帧 |
+| 探针单独捕获 | 父窗口导出正常，选择器同时列出两类源窗；受合成后端限制未出帧 | 授予 Window（BGRA `1280×800` MemFd，stride 5120，裁剪 `850×650`）；全屏覆盖时持续更新 |
+| 组合会话授权 | `RemoteDesktop.Start` 仅提供屏幕/输出流，不提供单窗流（[KDE Portal 6.3.5](https://github.com/KDE/xdg-desktop-portal-kde/blob/v6.3.5/src/remotedesktop.cpp#L240) / [6.7.6](https://github.com/KDE/xdg-desktop-portal-kde/blob/v6.7.6/src/remotedesktop.cpp#L182) 源码均如此） | 同时授予 Window、Pointer、Keyboard，且 `mapping_id` 与 `1280×800` EIS 区域匹配 |
+| 并排输入 | 阻塞于组合会话启动 | 1–9 点击与滚轮命中源窗、黑边拦截成功；但 F9 空格键回到探针（键盘失败） |
+| 全屏覆盖输入 | 阻塞于组合会话启动 | 点击第 5 按钮事件回到探针、源窗未命中（全屏布局失败） |
+| 停止与清理 | 选窗期 `toggle` 与关闭选择器正常退出 | `Esc`、`toggle` 及关闭源窗均正常清理并可重新授权 |
+
+> **关键结论**：通用 Portal/EIS 路径在 Plasma（组合会话不支持单窗流）与 GNOME（全屏覆盖命中/焦点回到探针，且 `Meta.WaylandPointer` 未向 GI 暴露，见 [window-stream](https://github.com/GNOME/mutter/blob/50.1/src/backends/meta-screen-cast-window-stream.c#L321)、[eis-client](https://github.com/GNOME/mutter/blob/50.1/src/backends/meta-eis-client.c#L503)、[wayland-pointer](https://github.com/GNOME/mutter/blob/50.1/src/wayland/meta-wayland-pointer.c#L1096)）均无法直接实现可靠的全屏覆盖交互，由此确立了**合成器原生后端负责交互 + Portal 负责只读预览**的技术路线。
+
+**组件级隔离测试**：
+- **Weston**：验证 `800×600` 源窗 1–9 点击、键盘、滚轮、独立弹窗与误投观察窗。
+- **嵌套 KWin 6.3.6**：确认原生 Wayland 与 XWayland 源窗并行计数，且独立 X11 下 `--xwayland` 启动会被正确拒绝。
+- **隔离 PipeWire 测试**：验证 MemPtr、MemFd、裁剪元数据与源节点消失处理。
+
+---
+
+## 二、通用 Portal / EIS 验证手册
+
+### 1. 环境准备与测试进程启动
+
+验收时需分别对 **原生 Wayland** 与 **XWayland** 源窗各执行一轮（不测试独立 X11 会话），记录合成器、XWayland、Portal、PipeWire、OBS 版本及输出分辨率/刷新率/缩放（100% 与 150% 分开记录）。Plasma 可用 `qdbus6 org.kde.KWin /KWin supportInformation` 导出合成与输出信息。
+
+在不同终端分别启动源窗、观察窗和探针（切换协议、布局或缩放时请使用独立日志目录）：
 
 ```sh
 mkdir -p /tmp/picalens-verification/plasma6-wayland-tiled-100
@@ -13,231 +173,46 @@ target/debug/picalens-test-window --sentinel 2>&1 | tee /tmp/picalens-verificati
 target/debug/picalens-probe --desktop-only 2>&1 | tee /tmp/picalens-verification/plasma6-wayland-tiled-100/portal.log
 ```
 
-用 `target/debug/picalens-test-window --xwayland` 启动 `PicaLens Source Window (XWayland)`。如果当前终端设置了 `GDK_BACKEND=wayland`，在这条命令前加 `env -u GDK_BACKEND`。两个模式的源窗默认窗口几何均为 800×600，显示每秒变化的计数、剧情和九个按钮。
+- **XWayland 源窗**：运行 `env -u GDK_BACKEND target/debug/picalens-test-window --xwayland`。
+- **协议核对**：原生轮核对 `event=mapped backend=GdkWaylandDisplay fixture=wayland`；XWayland 轮需安装 `xdpyinfo` 并核对 `backend=GdkX11Display fixture=xwayland`（若出现 `x11-unverified` 需手动确认服务器类型）。
+- **辅助窗口**：点击 `Open test popup` 打开临时弹窗；观察窗 `PicaLens Input Sentinel` 独立运行，可加 `--xwayland` 测试 XWayland 观察窗。
+- **云端 Codex 构建环境**（Rust 1.100.0）：
+  ```sh
+  source /workspace/.picalens-env/activate.sh
+  export BINDGEN_EXTRA_CLANG_ARGS="-resource-dir=$PICALENS_SYSROOT/usr/lib/llvm-19/lib/clang/19"
+  cargo build --locked
+  ```
 
-用 `event=mapped backend=GdkWaylandDisplay fixture=wayland` 核对原生 Wayland。XWayland 轮需要 `xdpyinfo` 检查服务器的 XWAYLAND 扩展，日志应为 `event=mapped backend=GdkX11Display fixture=xwayland`。若日志为 `fixture=x11-unverified`，该次仍待确认服务器类型。`event=layout` 记录 GDK 表面尺寸，可能包含客户端阴影。用 `Open test popup` 打开独立的临时窗口。误投观察窗 `PicaLens Input Sentinel` 运行在独立进程中，记录收到的输入，可另加 `--xwayland` 测试另一类观察窗。
+### 2. 实验一：OBS 遮挡捕获与探针单窗流
 
-`--desktop-only` 记录会话环境、Portal 接口版本和后端声明的能力。记录捕获、授权和输入结果时，以选窗后的会话日志及各窗口收到的事件为准。
+1. 在 OBS 中添加 PipeWire 窗口捕获并选中源窗，依次观察各 15 秒：**完全可见** → **被其他窗口完全遮挡** → **最小化** → **切至其他工作区**，并分别记录恢复可见后是否继续出帧（并排与全屏布局分别留存录屏证据）。
+2. 关闭 OBS，运行默认捕获探针：
+   ```sh
+   target/debug/picalens-probe 2>&1 | tee /tmp/picalens-verification/plasma6-wayland-tiled-100/capture.log
+   ```
+3. 记录授予的源类型、流尺寸、格式、缓冲区类型、`wayland_parent_exported`、持续出帧情况与停止原因。
 
-## 实验一 · OBS 捕获与遮挡
-
-1. 在 OBS 添加支持系统选择窗口的 PipeWire 捕获源，并在选择器选中测试源窗。先让窗口可见 15 秒，查看预览或录屏中的计数和背景变化。
-2. 用另一扇窗口完全盖住源窗，保持 OBS 输出可观察。再观察 15 秒，记录预览中的计数是否持续变化及是否中途停顿。恢复可见，记录是否恢复出帧。
-3. 分别将源窗口最小化、将源窗口留在另一个工作区，每种情况观察 15 秒，再恢复源窗。分别记录结果和恢复行为。
-4. 对计划支持的并排、全屏显示布局分别保留证据。在每个布局中至少记录一段完整的计数变化。需要观察全屏遮挡时，可用 OBS 录屏，结束后再查看对应片段。
-
-随后关闭 OBS 捕获并运行默认探针，单独验证 PicaLens 使用同一源窗的捕获会话。
-
-```sh
-target/debug/picalens-probe 2>&1 | tee /tmp/picalens-verification/plasma6-wayland-tiled-100/capture.log
-```
-
-记录 Portal 授予的源类型、流尺寸、协商格式、缓冲区类型、画面是否持续更新和停止原因。同步记录 `wayland_parent_exported`，用于判断探针是否能向系统选择器传递 GTK 窗口标识。OBS 的结果和探针的结果分别填写。
-
-## 实验二 · 输入命中
+### 3. 实验二：RemoteDesktop / EIS 输入命中
 
 ```sh
 target/debug/picalens-probe --experiment 2>&1 | tee /tmp/picalens-verification/plasma6-wayland-tiled-100/input.log
 ```
 
-在 Portal 选择同一源窗，记录窗口流以及实际授予的指针和键盘权限。在探针日志中核对窗口流的 `mapping_id` 与 EIS 绝对坐标区域是否能对应。区域缺失、连接失败或授权不足都记录为阻塞，保留可观察的捕获结果。
+1. 核对授予的窗口流、指针/键盘权限，以及窗口流 `mapping_id` 与 EIS 绝对坐标区域的对应关系（缺失或授权不足直接记录为阻塞）。
+2. 分别在 **并排布局** 与 **全屏覆盖布局（F11）** 下测试。在隔离桌面中按 `F8`（或点击 `Arm sample`）启用 5 秒单次采样（可发送一次主键点击、一次滚轮或按 `F9` 发空格），每次采样后等待 ≥ 1 秒观察日志；`Esc` 先解除启用再退出。
+3. 使用 `source` / `popup` / `sentinel` 前缀与 `monotonic_us` 对齐核对下表（详见 [RemoteDesktop Portal 规范](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)）：
 
-分别测试以下布局，切换布局后重新核对源窗、观察窗与探针的位置。
-
-- **并排**。源窗口完整可见，探针在一旁。观察窗放在同一显示器，避开源窗口。
-- **全屏覆盖**。将探针置于源窗口所在的显示器，用 F11 全屏。源窗保持已打开并被完全盖住。观察窗保持运行，可通过窗口管理器把它置于源窗下方，单独检查坐标和焦点误投。
-
-交互采样只在隔离的实验桌面上用测试窗运行。F8 或窗口标题栏的 Arm sample 在五秒内启用一次采样，可尝试一次主键点击、一次离散滚动或按 F9 发送一次空格键。每次采样后等至少一秒，探针会在这段时间记录返回到自身的事件。下一次采样前将焦点切回探针，再重新启用采样。F11 切换全屏并解除启用。Esc 先解除启用，再按退出捕获。坐标映射不明确或画面过期时，探针拒绝启用输入。有裁剪的画面要求 EIS 区域尺寸和完整流尺寸完全一致，坐标再按裁剪偏移映射。
-
-每轮在下列操作前记下时间，观察探针和接收窗口的日志。源窗、弹窗和观察窗分别以 `source`、`popup`、`sentinel` 为日志前缀，使用 `monotonic_us` 对齐记录。布置窗口时产生的物理输入与试验时产生的转发输入分开记录。
-
-| 操作 | 核对项 |
+| 操作 | 核对标准 |
 | --- | --- |
-| 按从左到右、从上到下的顺序，各点一次九个按钮 | 源窗的 `event=hit target=` 恰好依次记录 1–9，剧情跟随每次命中更新。观察窗没有对应输入 |
-| 在画面内滚动一次，下一次采样按 F9 | 如果源窗收到对应的滚轮及空格键事件，记录对应日志。如果观察窗或探针收到转发事件，记录实际接收方并判为误投 |
-| 调整视图宽高比，在黑边内点击和滚动 | 源窗与观察窗均没有收到对应的转发事件 |
-| 打开测试弹窗，记录状态后关闭弹窗 | 当前探针无法可靠读取源窗弹窗状态。只在隔离桌面上明确测试弹窗路由时启用一次采样，记录收到事件的窗口 |
-| 启用采样后将焦点切给观察窗，再恢复探针焦点 | 检查启用状态是否已解除，以及原窗和观察窗有无收到转发事件 |
-| 关闭源窗、取消选窗或在桌面撤销共享 | 记录探针停止原因，检查指针和键盘状态是否释放，确认重新选窗可开始新会话 |
-| 在选窗期间和捕获期间，从另一终端执行 `target/debug/picalens-probe toggle` | 分别检查选窗是否结束、捕获是否停止。空闲时执行同一命令会启动只读选窗 |
-
-组合会话先选择输入设备和窗口源，再启动会话。若后端仅开放 D-Bus `Notify*`，把绝对指针定位作为后续的独立会话实验。已连接 EIS 的会话只经 EIS 发事件。操作系统把事件投给哪个窗口，以接收侧日志为准。 [RemoteDesktop Portal](https://flatpak.github.io/xdg-desktop-portal/docs/doc-org.freedesktop.portal.RemoteDesktop.html)
-
-## 结果表
-
-### 渲染显卡与 Anime4K
-
-在 Ubuntu 26.10 的 KWin 6.7.5 DRM 虚拟机中，选择了唯一可用的 VirGL 渲染节点 `/dev/dri/renderD128`。FSR 1、SGSR 和 Anime4K 的两类源窗都由该节点出帧。在 1280×768、100% 缩放和 1280×960、150% 缩放下，十二轮均验证了九点点击、滚轮、A 键和退出恢复。100% 的六轮同时验证了黑边隔离。初次 Anime4K 原生 Wayland 试验伴随 Libinput 的虚拟机计时过慢告警，前两次点击漏投。拉开点击间隔后，复测依序命中 1–9。
-
-在 Mesa 上对比固定的 16×12 RGB 测试图放大到 32×24 的结果。PicaLens Anime4K 和 mpv 0.41.0 使用相同的 Anime4K v4.0.1 上游着色器链，两张图的方向和尺寸一致，8 位 RGB 各通道的最大差值为 1。单个 Debian 包已在 Debian 13 与 Ubuntu 26.10 的隔离环境安装，分别选中 KWin 6.3.6 和 6.7.5 后端。
-
-在安装同一测试包的 Ubuntu 26.10 DRM 会话中，从现有界面打开 KDE Portal 选窗。原生 Wayland 窗口获授权后，PipeWire 持续提供 800×600 的 BGRx 单窗帧。Anime4K 在显式选中的 `renderD128` 上出帧，窗口化预览显示了处理后的画面。点击预览时源窗未收到点击。
-
-在预设界面先保存「自动」，再从列表选择 `0000:00:01.0` 并保存。随后通过「选择窗口」放大全屏，KWin 日志确认 Anime4K 使用该 PCI 设备对应的 `renderD128`。
-
-为全屏预设指定不存在的设备，以及在放大时暂时移走虚拟渲染节点，都返回 `render_gpu_missing`。强制结束渲染进程返回 `render_worker_failed`。三轮退出后源窗持续运行，虚拟节点恢复后可再次枚举。
-
-切回旧版 KWin 后端时，新应用对 Anime4K 全屏报告 `interactive_gpu_backend`。移除预设中的显卡配置键并选择 FSR 1 后，旧版后端仍从原入口绘制了全屏画面。
-
-用固定 RGBA 帧测量独立渲染进程的一次请求和结果回读。每档预热一帧，统计随后三帧。此虚拟节点通过 VirGL 在宿主机的 llvmpipe 上运行。
-
-| 滤镜 | 720p → 1080p | 1080p → 2160p |
-| --- | --- | --- |
-| FSR 1 | 157.8 ms · 6.10 fps | 637.4 ms · 1.60 fps |
-| SGSR | 112.5 ms · 8.98 fps | 393.5 ms · 2.55 fps |
-| Anime4K | 551.8 ms · 1.81 fps | 1102.9 ms · 0.91 fps |
-
-虚拟机只能访问一张虚拟 GPU。真实双 GPU 交替选卡、拔卡与物理显卡性能仍待验收。
-
-### FSR 1 与 SGSR 交互全屏
-
-在每组测试中都选中一扇已打开的窗口，确认画面经过所选滤镜，再依序点击九个位置、滚动并按 A 键。留边的点击和滚轮均未送达源窗或观察窗。两个滤镜的截图对比覆盖了线性放大和两种滤镜之间的差异。
-
-| 测试会话 | 原生 Wayland | XWayland |
-| --- | --- | --- |
-| Plasma 6，KWin 6.7.5，VirGL，1280×768 @ 100% | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
-| niri 26.04，嵌套 OpenGL ES，1280×768 @ 100% | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
-| Hyprland 0.53.3，VirGL，640×480 @ 100% | FSR 1、SGSR 均通过 | FSR 1、SGSR 均通过 |
-
-Plasma 另在 1920×1080 @ 150% 通过了 SGSR 与 XWayland 的交互复测。Hyprland 另确认原窗打开测试弹窗时会结束放大，焦点留在弹窗。 [Plasma 记录](kwin-experiment.md) · [niri 记录](niri-experiment.md) · [Hyprland 记录](hyprland-experiment.md)
-
-### niri 与 Hyprland 单窗放大
-
-在 Ubuntu 26.04 虚拟机中使用 QEMU virtio GPU 和 VirGL。合成器通过虚拟 DRM 设备输出画面，PicaLens 读取 Portal 授权的实际 PipeWire 节点。
-
-| 会话 | 原生 Wayland 源窗 | XWayland 源窗 | 退出与恢复 |
-| --- | --- | --- | --- |
-| niri 26.04，GNOME Portal 50 | 持续接收 BGRx DMA-BUF 帧，FSR 1 启用，源窗从 538×786 改为 590×470 后继续出帧 | 持续接收 540×420 DMA-BUF 帧，FSR 1 启用，F11 切换预览模式 | `Super+F8` 停止预览。关闭源窗会结束 Portal 会话 |
-| Hyprland 0.53.3，Hyprland Portal 1.3.11 | 持续接收 560×440 BGRx DMA-BUF 帧，SGSR 启用 | 持续接收 560×440 BGRx DMA-BUF 帧，SGSR 启用 | `picalens toggle` 可结束预览并重新选窗。选中整屏会在打开 PipeWire 流之前被拒绝 |
-
-旧版 Hyprland ScreenCast 私有接口 v3 错移了流结果的 `source_type`。PicaLens 在确认当前会话由该后端提供后按旧编号识别窗口。新版接口使用标准编号。原始日志和截图位于云工作区的 `/workspace/scratch/picalens-lab/desktop-vm/`。 [旧版后端源码](https://github.com/hyprwm/xdg-desktop-portal-hyprland/blob/v1.3.11/src/portals/Screencopy.cpp) · [新版后端源码](https://github.com/hyprwm/xdg-desktop-portal-hyprland/blob/v1.4.0/src/portals/Screencopy.cpp)
-
-### niri 26.04 原窗口交互
-
-将带补丁的 niri 嵌套运行在 QEMU/VirGL 的 niri Wayland 会话中，从 PicaLens 的 `toggle` 入口点选源窗。原生 Wayland 和由 XWayland `:1` 托管的源窗各自依序收到 1–9 点位、滚轮和 A 键按下及释放。黑边点击与滚轮未送达源窗。观察窗在两轮输入期间未收到点击、滚轮或按键。Esc、切走焦点和选窗期间再次 `toggle` 各验证一次。日志位于 `/workspace/scratch/picalens-lab/desktop-vm/`。 [构建与试用](niri-experiment.md)
-
-### Hyprland 0.53.3 原窗口交互
-
-在 QEMU/VirGL 的 Hyprland `0.53.3+ds-4` 会话中加载匹配的后台组件。从 PicaLens 界面的「选择窗口」和 `toggle` 分别开始放大。原生 Wayland、XWayland 源窗各依序收到 1–9 点位、滚轮和 A 键。XWayland 记录到两个方向的非零滚轮增量。黑边输入未送达源窗，观察窗未记录误投。Esc、再次 `toggle`、关闭源窗和切换焦点均结束放大。两款交互后端均在 100% 输出缩放下验收。 [构建与试用](hyprland-experiment.md)
-
-### DDE Wayland 的 Treeland 0.12.1
-
-此处结果来自实验构建。Treeland 0.12.1 和 dde-wlroots 0.20.2.1 的基础源码来自 GitHub，构建依赖来自 Ubuntu 软件包归档。在 Ubuntu 26.10 虚拟机中直接启动合成器，使用 VirGL、OpenGL ES 3.1 以上、640×480 @ 100%。完整 DDM 登录流程与物理显卡性能仍待验收。 [后端与使用](treeland-experiment.md)
-
-在 Treeland 会话中选中原生 Wayland 或 XWayland 源窗，两类窗口在 FSR 1 和 SGSR 下均依次收到九个位置的点击、双向滚轮和 A 键按下及释放。黑边的点击和滚轮未送达源窗或观察窗。关闭正在放大的原生 Wayland 窗口后，可以继续选择并放大 XWayland 窗口。XWayland 的 `:0` 已通过 `xdpyinfo -queryExtensions` 确认具有 XWAYLAND 扩展。
-
-使用构建产物内置的着色器复测时，XWayland 源窗先后运行 FSR 1、SGSR、线性和 FSR 1。同一静态区域的截图逐像素比较确认三种滤镜产生各自的渲染结果。
-
-### COSMIC、Sway 与 Denial
-
-交互验收要求同一个会话授予所选窗口的流、鼠标和键盘，并能把窗口流的 `mapping_id` 唯一对应到 EIS 绝对坐标区域。进入点击、滚轮、键盘和滤镜测试之前，先用 `picalens-probe --desktop-only` 检查声明的能力，再用 `--experiment` 检查会话授权。
-
-| 会话 | 验证结果 | 交互放大 |
-| --- | --- | --- |
-| COSMIC Epoch 1.11.0 | 发布版为单窗流设置 `mapping_id: None`，合成器按输出声明 EIS 绝对坐标区域。后续会话实测见下文。 [窗口流源码](https://github.com/pop-os/xdg-desktop-portal-cosmic/blob/f448ddfb296bf7bb23517b24b2f532559a334a1c/src/screencast.rs#L302-L326) · [EIS 区域源码](https://github.com/pop-os/cosmic-comp/blob/8cb1802caada438bb5cc7670dfabdaca5fad0502/src/libei.rs#L29-L48) | 暂不支持 |
-| Sway 1.12，wlr Portal 0.9.0 | Ubuntu 26.10 嵌套 Wayland 会话实测。ScreenCast v5 声明 `0x3`，原生 Wayland 和 XWayland 均取得 Window 类型的 PipeWire 流并持续收到 BGRx 帧。实验探针报告缺少 `org.freedesktop.portal.RemoteDesktop`。Sway 的虚拟鼠标指定 seat 或输出，公开协议没有目标窗口参数。 [Portal 接口声明](https://github.com/emersion/xdg-desktop-portal-wlr/blob/v0.9.0/wlr.portal) · [虚拟输入源码](https://github.com/swaywm/sway/blob/1.12/sway/input/input-manager.c#L398-L431) | 暂不支持 |
-| Denial 0.6.10 | 在 Debian 13 的 QEMU/VirGL 虚拟机中启动官方 amd64 包。Debian 自带的 wlr Portal 0.7.1 仅声明屏幕源 `0x1`，原版 0.9.0 声明屏幕和窗口源 `0x3`。两轮均实测缺少 RemoteDesktop。图形探针和应用在此会话的 GTK 4.18 中启动时崩溃，单窗出帧和界面提示未验收。 [官方发布包](https://github.com/denialwm/denial/releases/tag/v0.6.10) · [Portal 路由](https://github.com/denialwm/denial/blob/v0.6.10/packaging/arch/denial-portals.conf) · [libeis 计划](https://github.com/denialwm/denial/blob/v0.6.10/docs/libeis_support_plan.md) | 暂不支持 |
-
-Sway 会话还验证了 `picalens toggle` 显示当前桌面不支持交互放大，以及从「选择窗口」打开显式只读预设能绘制首帧。
-
-### 原版桌面交互复测
-
-虚拟输出试验把现有测试窗口临时移到新输出，再从实体输出的全屏预览操作。需要同时验证两类窗口的输入命中、焦点隔离和原窗恢复，才进入线性、FSR 1 和 SGSR 的完整验收。
-
-| 原版会话 | 复测结果 |
-| --- | --- |
-| GNOME Shell 和 Mutter 51.0 | Portal 同时授予虚拟输出流、鼠标和键盘，流的 `mapping_id` 与 EIS 的 800×600 区域匹配。等 PipeWire 完成格式协商后连接 EIS，原生 Wayland 和 XWayland 原窗各命中第 5 个按钮。两次点击都把焦点从全屏预览切到虚拟输出的原窗。结束 XWayland 试验后输出被回收，窗口回到实体输出，位置由 `(240, 116)` 变为 `(240, 100)`。 [虚拟输出接口](https://github.com/GNOME/mutter/blob/51.0/data/dbus-interfaces/org.gnome.Mutter.ScreenCast.xml#L158-L199) |
-| Sway 1.12 | QEMU/VirGL 的 DRM 会话可以创建和回收虚拟输出，也可以把窗口移入该输出。临时座席向 XWayland 测试窗送达点击、滚轮和按键。原生 GTK 4.24 测试窗看到新的 `wl_seat` 通告，未绑定该座席，也未收到样本输入。 [虚拟输入实现](https://github.com/swaywm/sway/blob/1.12/sway/input/input-manager.c#L398-L448) |
-| niri 26.04 | 原版 DRM 会话的 ScreenCast v5 声明 `0x7`。RemoteDesktop v2 的设备类型为 `0x0`，交互探针在申请指针前停止。原版 IPC 提供移窗命令，虚拟输出和 RemoteDesktop 仍有上游跟踪项。 [RemoteDesktop PR](https://github.com/niri-wm/niri/pull/1966) · [虚拟输出讨论](https://github.com/niri-wm/niri/discussions/714) |
-| DDE Treeland 0.12.1 | 原版 Treeland、dde-wlroots 0.20.2.1 和 DDE Portal 6.2.1 从上游源码构建。QEMU/VirGL 的 DRM 会话中，原生 Wayland 和 XWayland 测试窗均成功映射。ScreenCast v5 声明 `0x3`。Portal 前端根据 `dde.portal` 提供 RemoteDesktop v2，设备类型为 `0x0`。D-Bus 实测 DDE 的 Wayland 后端没有导出 RemoteDesktop，交互探针在申请指针前停止。完整 DDM 登录未验收，DDE 仍在适配中。 [Portal 声明](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/6.2.1/misc/dde.portal) · [Wayland 接口注册](https://github.com/linuxdeepin/xdg-desktop-portal-dde/blob/6.2.1/src/wayland/portalwaylandcontext.cpp) |
-| COSMIC Epoch 1.11.0 | 使用与发布版提交匹配的原版二进制启动嵌套会话。Portal 同时授予窗口流、鼠标和键盘，原生 Wayland 和 XWayland 单窗流均持续出帧。两次选窗的 `mapping_id` 都为空，交互探针拒绝注入输入。公开窗口几何接口可用于坐标换算，发布版缺少可单独承载原窗口的软件虚拟输出。 [单窗流实现](https://github.com/pop-os/xdg-desktop-portal-cosmic/blob/f448ddfb296bf7bb23517b24b2f532559a334a1c/src/screencast.rs#L302-L326) · [虚拟输出讨论](https://github.com/pop-os/cosmic-comp/issues/2878) |
-| Denial 0.6.10 | Debian 13 的 QEMU/VirGL 会话中，wlr Portal 0.9.0 声明窗口源，RemoteDesktop 接口仍缺失。`weston-simple-shm` 收到配置并持续提交原生 Wayland 缓冲区，XWayland 测试窗确认映射。原生 GTK 4.18 测试窗和 PicaLens 探针仍在启动时崩溃，应用内单窗出帧未验收。 [官方发布包](https://github.com/denialwm/denial/releases/tag/v0.6.10) |
-
-在缺少兼容后端的 GNOME 和 niri 会话中，通过「选择窗口」启动线性等比全屏，均验证应用报告「当前桌面暂不支持交互放大」。要使用现有的 ScreenCast 采集路径，可以选择窗口化等只读预设。
-
-### Plasma 6 Wayland 验收
-
-| 源窗 | OBS 与探针捕获 | 并排输入 | 全屏覆盖输入 |
-| --- | --- | --- | --- |
-| 原生 Wayland | 嵌套环境已验证选窗，出帧阻塞于 KWin 合成 | 组合会话未启动流，待测 | 组合会话未启动流，待测 |
-| XWayland | 在 KWin 6.3.6 的 XWayland 24.1.6 上已启动源窗，KDE 选择器同时列出两种源窗。出帧仍受 OpenGL 合成限制 | 待测 | 待测 |
-
-配对选窗截图、XWAYLAND 扩展和两个源窗的日志存放在云工作区的 `/workspace/scratch/picalens-lab/evidence-xwayland/`。
-
-### 先前实验记录
-
-先前两轮桌面实验使用原生 Wayland 源窗。Plasma 使用 KWin 6.3.6、KDE Portal 6.3.5、XDG Desktop Portal 1.20.3、PipeWire 1.4.2 和 OBS 30.2.3.1-3。嵌套后端因缺少 DRM 设备使用 QPainter。GNOME 50 的历史结果保留供比较。该轮使用 Shell/Mutter 50.1、GNOME Portal 50.0、XDG Desktop Portal 1.21.1、PipeWire 1.6.2 和 OBS 32.1.0，Mutter Development Kit 提供 1280×800 虚拟输出，缩放为 100%。
-
-日志、截图与 GNOME OBS 录屏存放在云工作区的 `/workspace/scratch/picalens-lab/evidence-plasma/` 和 `/workspace/scratch/picalens-gnome-lab/evidence-gnome/`。
-
-| 观测项 | Plasma 6 | GNOME 50 |
-| --- | --- | --- |
-| Portal 声明的源类型和输入设备 | ScreenCast v5（源类型 `0x3`），RemoteDesktop v2（输入设备 `0x7`），GlobalShortcuts v1 | ScreenCast v5（`0x7`），RemoteDesktop v2（`0x7`），GlobalShortcuts v1 |
-| OBS 可见时持续更新 | 选中源窗后 KWin 报 `OpenGL compositing is required for screencasting`，未出帧 | 录屏 t=25.5–40.5 s，源窗计数 172→187 |
-| OBS 完全遮挡时持续更新 | 阻塞于可见基线 | OBS 最大化覆盖源窗，六次间隔约 3 秒的预览采样计数为 88、92、95、99、102、105 |
-| OBS 最小化与恢复 | 阻塞于可见基线 | 最小化后约 15 秒内预览计数 189→205，恢复后仍出帧 |
-| OBS 切工作区与恢复 | 阻塞于可见基线 | 源窗留在另一工作区，录屏 t=124.5–139.5 s 的计数 271→286，移回后仍出帧 |
-| 探针单独捕获 | GTK 父窗口标识已导出，选择器列出并可选中原生源窗。KWin 因合成限制未启动流 | 实际授予 Window。BGRA、1280×800、MemFd、stride 5120、裁剪 850×650，隐藏光标。探针全屏覆盖源窗时，约 15 秒内计数继续更新 |
-| 组合会话实际授权 | 到达 `RemoteDesktop.Start`。界面只提供屏幕和输入设备，尝试启动 `X11-0` 输出流时也遇到合成限制 | 实际授予 Window、Pointer 和 Keyboard，窗口流与带相同 `mapping_id` 的 1280×800 EIS 绝对坐标区域匹配 |
-| 并排输入 | 阻塞于组合会话启动 | 1–9 全部按顺序命中源窗，滚轮到达源窗，黑边点击被拦截。F9 发出的空格键回到探针，键盘验收失败 |
-| 全屏覆盖输入 | 阻塞于组合会话启动 | 源窗被覆盖时，点击画面中心第 5 个按钮，转发的按下与松开均回到探针，源窗无命中。判定此布局失败，未继续其余点位和按键 |
-| 弹窗、切焦点、误投观察 | 阻塞于组合会话启动 | 已验证切焦点解除启用、回到探针的空格不会再次启用采样。观察窗在已采样的时段未收到误发；探针收到误投已使验收失败。Portal 路径下的弹窗投递未测 |
-| 停止原因与清理 | 选窗期间 `toggle` 关闭选择器和探针。手动关闭选择器后正常退出。活动流清理受合成限制 | Esc 和 `toggle` 都结束活动流。关闭源窗时已收到节点移除，探针退出。随后重新授权可获得新会话 |
-
-KDE Portal 6.3.5 的 `RemoteDesktop.Start` 在启用画面共享时从输出或工作区创建流。这个版本的组合会话限制与本次 KWin 合成环境限制是两项独立结果。 [KDE Portal 6.3.5 源码](https://github.com/KDE/xdg-desktop-portal-kde/blob/v6.3.5/src/remotedesktop.cpp#L240)
-
-KDE Portal 6.7.6 源码的 `RemoteDesktop` 启动路径只有虚拟输出、已有输出和工作区流三种分支。当前 Plasma 运行结果来自上表的 6.3.x 环境。 [KDE Portal 6.7.6 源码](https://github.com/KDE/xdg-desktop-portal-kde/blob/v6.7.6/src/remotedesktop.cpp#L182)
-
-## 组件测试
-
-- 在 Weston 的原生 Wayland 会话中，已检查 800×600 源窗，收到 1–9 按钮点击、键盘与滚轮日志，测试弹窗能独立打开并接收焦点。误投观察窗能单独启动并记录输入。
-- 在嵌套 KWin 6.3.6 中，两类源窗并行启动并持续计数，日志分别确认 `fixture=wayland` 和 `fixture=xwayland`。直接操作 XWayland 源窗时，第 5 个按钮、滚轮和 A 键均收到事件。探针转发仍待实测。独立 X11 环境的 `--xwayland` 启动检查已验证会拒绝。
-- 在隔离的 PipeWire 测试中，已验证 MemPtr、MemFd、裁剪和源节点消失。OBS 和桌面 Portal 组合会话的结果见上表。
-
-使用当前 Codex 云端工作区已有的构建环境时，先加载其工具链和开发库，再运行 Cargo。当前构建使用 Rust 1.100.0。
-
-```sh
-source /workspace/.picalens-env/activate.sh
-export BINDGEN_EXTRA_CLANG_ARGS="-resource-dir=$PICALENS_SYSROOT/usr/lib/llvm-19/lib/clang/19"
-cargo build --locked
-```
-
-## 推进条件
-
-- 0.0.1 在 Plasma 6 Wayland 上至少需要一条窗口流在目标布局中持续出帧，并分别记录原生 Wayland 和 XWayland 源窗在并排和全屏布局下的实验结果。
-- 只有两种源窗均通过全屏九点、黑边、弹窗和切焦点检查，才认为 Plasma 提供可交互的放大。0.1 还要在 100% 和 150% 缩放下复测，切焦点和关闭窗口各试十轮。任何一轮误投都暂停交互发布。
-- 如其中一种路径尚未通过，继续验证 KWin 集成，已通过捕获的组合可提供只读技术预览。
-
-## 合成器集成验证入口
-
-在 Plasma 6 Wayland 会话中，从 `picalens` 或 `picalens toggle` 进入合成器交互模式。KWin 负责选窗、等比绘制和输入映射。原生 Wayland 与 XWayland 均已在嵌套 KWin 6.3.6 的 QPainter 后端通过 100% 和 150% 缩放的输入对照。DRM/OpenGL 后端与 Portal 窗口流分别验收。 [Plasma 构建与验收](kwin-experiment.md)
-
-Mutter 50.1 对窗口流的 EIS 绝对坐标做表面到舞台的坐标变换，然后向 Clutter 虚拟设备发送移动和按键。GNOME 50.1 实机类型绑定检查确认 Shell 可获取窗口演员、查询位置下的演员，并反算演员坐标。`Meta.WaylandPointer` 未从该版本的 GObject Introspection 暴露，设置 Wayland 指针焦点的函数位于 Mutter 内部。当前源码审查及实测尚未确认 Shell 扩展能将点击投给被覆盖的源面，不能据此开启该路径。 [窗口流坐标变换](https://github.com/GNOME/mutter/blob/50.1/src/backends/meta-screen-cast-window-stream.c#L321) · [EIS 事件提交](https://github.com/GNOME/mutter/blob/50.1/src/backends/meta-eis-client.c#L503) · [Wayland 指针焦点](https://github.com/GNOME/mutter/blob/50.1/src/wayland/meta-wayland-pointer.c#L1096)
-
-## 0.0.4 菜单与缩放验收
-
-- GNOME 51 实机，1920×1200、150% 缩放。桌面启动器的 Toggle 动作打开系统选窗，《村正》窗口流的裁剪区域为 1545×912，使用线性 DMA-BUF。新版全屏预览映射为 1280×800 逻辑像素，持续出帧后按 Esc 回到菜单。
-- 隔离的 GNOME 51 会话，1920×1200、150% 缩放。用与《村正》窗口流等尺寸的四色角标测试纹理验证截图。等比适应截图保留四角和上下黑边，裁剪铺满截图按预期裁剪两侧。两张 PNG 均为 1920×1200。
-- GNOME 51 的组合会话分别出现过仅授予键盘与指针、仅授予带 `mapping_id` 的窗口流两种结果。前者无法映射到目标窗口，后者无法启用探针的单次输入。100% 隔离会话和 150% 实机均未通过组合验收，已打开窗口继续使用只读预览。
-- 隔离的 KWin 6.7.5 会话，1280×800。新后端公布 `fit`、`stretch`、`fill`，裁剪铺满把 800×500 源矩形映射到全屏。测试源窗记录了中心第 5 个按钮命中和 A 键按下及释放。
-- Gamescope 3.16.24 通过 PicaLens 界面从带中文和空格的路径启动 Wine 测试程序。游戏窗口实际映射，接收鼠标点击和键盘输入。首发三语目录通过一致性检查，中文和日文界面完成运行检查，三个语言设置分别通过已安装二进制的 CLI 文案检查。
-
-## 0.0.5 GNOME 原窗口交互
-
-GNOME Shell 51.0 和 Mutter 51.0 的隔离会话使用 1920×1200 输出。PicaLens 选择原生 Wayland 测试窗，Shell 直接变换原窗口的演员，Mutter 负责鼠标命中。100% 和 150% 缩放均通过九点点击和滚轮检查，等比模式的黑边点击没有送给源窗。Esc 恢复原窗，快捷键命令 `picalens toggle` 可取消选窗和结束放大。扩展禁用后，同一个客户端回退到 Portal 选窗。其他 D-Bus 连接请求开始放大收到 `AccessDenied`。
-
-在 150% 会话中，使用独立游戏副本和 Wine 前缀启动 `Muramasa_chs.exe`。隔离的 PipeWire 空音频输出满足游戏的 DirectSound 初始化。受测游戏通过 Wine Wayland 出窗后，在交互全屏中用鼠标打开「设定画面」并回到标题。随后强制结束测试客户端，扩展收到客户端断开事件并恢复窗口和 Shell 顶栏，游戏进程继续运行。
-
-Ubuntu 27.04 的 `.deb` 包含 GNOME 扩展。首次安装到用户目录时，Shell 在重新登录时扫描并加载新扩展。已在隔离会话验收加载后的行为，当前桌面会话保留到用户自行重新登录。
-
-## 0.0.6 GNOME XWayland 原窗口交互
-
-- 在隔离的 GNOME Shell 51.0 会话使用 Ubuntu Mutter `51.0-1ubuntu3` 和 1920×1200 输出。仅放开扩展的 XWayland 选窗限制时，边缘点击丢失。补丁为放大中的窗口反算坐标，再沿用 Mutter 原有的 XWayland 缓冲区坐标换算。未加载补丁的 Shell 仍只在交互选窗中列出原生 Wayland 窗口。 [Mutter 51 XWayland 坐标实现](https://gitlab.gnome.org/GNOME/mutter/-/blob/51.0/src/wayland/meta-xwayland-surface.c)
-- 100% 和 150% 缩放下，XWayland 测试窗均按顺序命中 1–9，接收滚轮和普通按键。黑边点击未送到源窗，Esc 结束放大。所打包的库在版本匹配时由测试 Shell 加载，模拟版本不符时启动器使用系统库。
-- 同一补丁会话同时列出原生 Wayland 和 XWayland 测试窗。选中原生 Wayland 测试窗后通过中心点击、滚轮和 Esc 恢复检查。
-- 在 150% 缩放下，用独立游戏副本和前缀启动 `Muramasa_chs.exe`。Wine 日志确认游戏加载了 `winex11.drv`，游戏同时出现在 XWayland 根窗口树和交互选窗中。放大后使用鼠标进入「设定画面」并返回标题。按 Esc 结束放大后返回 PicaLens，游戏进程仍在运行。
-
-## 0.0.7 快捷键直接放大活动窗口
-
-- 在隔离的 GNOME 51 和 KWin 6.7.5 会话通过桌面绑定发送 Ctrl+Super+Z。原生 Wayland 与 XWayland 测试窗都能直接放大，命中中心按钮，再按同一组合键恢复。
-- GNOME 中用界面的「选择窗口」打开选择器并放大源窗。PicaLens 自己获得焦点时，快捷键提示没有支持的活动窗口。GNOME 和 KWin 均拒绝未持有 PicaLens 应用名称的 D-Bus 连接发起直接放大。
+| 依序点击九宫格 1–9 | 源窗 `event=hit target=` 依次记录 1–9，观察窗零误投 |
+| 画面内滚轮 + `F9` 空格键 | 源窗收到滚轮与空格；若观察窗或探针收到转发事件即判误投 |
+| 黑边点击与滚动 | 源窗与观察窗均无转发输入 |
+| 打开测试弹窗后采样 | 仅在隔离桌面显式测试弹窗路由时采样，记录实际接收窗口 |
+| 启用采样后切焦点至观察窗 | 确认采样自动解除，原窗与观察窗无误发 |
+| 关闭源窗 / 取消选窗 / 撤销共享 | 记录停止原因，确认按键/指针状态释放并可重新开始新会话 |
+| 选窗期 / 捕获期运行 `picalens-probe toggle` | 分别终止选窗或捕获；空闲时执行启动只读选窗 |
+
+### 4. 交互发布准入标准
+
+- 原生 Wayland 与 XWayland 两种源窗均需通过全屏九点、黑边隔离、弹窗与切焦点检查，并在 100% / 150% 缩放下各完成 10 轮切焦点与关闭窗口复测。
+- **零误投原则**：任意一轮出现输入误发至其他窗口，立即暂停该桌面组合的交互发布，仅保留只读技术预览。
