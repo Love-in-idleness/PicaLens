@@ -71,3 +71,32 @@ Anime4K v4.0.1
 Copyright (c) 2019–2021 bloc97
 MIT license. See anime4k/LICENSE and the notices in the individual shader files.
 Source: https://github.com/bloc97/Anime4K/tree/4029bf701ecaa15f163cdc49cffe5501c1acf410
+
+------------------------------------------------------------------------------------------------------------------------------
+FidelityFX Contrast Adaptive Sharpening (CAS)
+Copyright (c) 2017–2021 Advanced Micro Devices, Inc. All rights reserved.
+MIT license.
+Source: https://github.com/GPUOpen-Effects/FidelityFX-CAS
+
+------------------------------------------------------------------------------------------------------------------------------
+Sharp-Bilinear
+Public Domain.
+Source: https://github.com/libretro/common-shaders/blob/master/interpolation/shaders/sharp-bilinear.cg
+
+------------------------------------------------------------------------------------------------------------------------------
+xBRZ Freescale
+Copyright (c) Zenju / Hyllian / libretro contributors.
+GNU General Public License v3.0 (GPLv3).
+Source: https://github.com/libretro/common-shaders/tree/master/xbrz/shaders/xbrz-freescale-multipass
+
+------------------------------------------------------------------------------------------------------------------------------
+CRT-Easymode
+Copyright (c) EasyMode.
+GNU General Public License (GPL).
+Source: https://github.com/libretro/common-shaders/blob/master/crt/shaders/crt-easymode.cg
+
+------------------------------------------------------------------------------------------------------------------------------
+Deband
+Copyright (c) Niklas Haas (haasn) / mpv contributors.
+GNU Lesser General Public License v2.1+ / GPLv3.
+Source: https://github.com/haasn/gentoo-conf/blob/xor/home/nand/.mpv/shaders/deband.glsl

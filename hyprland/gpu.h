@@ -21,6 +21,7 @@ class Upscaler {
         GLuint id = 0;
         GLint sampler = -1;
         GLint size = -1;
+        GLint sharpness = -1;
 
         bool compile(const std::string& algorithm);
         void draw(CFramebuffer& destination, const SP<CTexture>& texture) const;

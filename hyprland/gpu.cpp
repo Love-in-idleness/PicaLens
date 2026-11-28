@@ -105,6 +105,7 @@ bool Upscaler::Program::compile(const std::string& algorithm) {
         return false;
     sampler = glGetUniformLocation(id, "inputImage");
     size = glGetUniformLocation(id, "outputSize");
+    sharpness = glGetUniformLocation(id, "sharpness");
     return true;
 }
 
@@ -115,6 +116,8 @@ void Upscaler::Program::draw(CFramebuffer& destination, const SP<CTexture>& text
     texture->bind();
     glUniform1i(sampler, 0);
     glUniform2f(size, destination.m_size.x, destination.m_size.y);
+    if (sharpness >= 0)
+        glUniform1f(sharpness, 0.8f);
     glDrawArrays(GL_TRIANGLES, 0, 3);
 }
 

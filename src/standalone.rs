@@ -590,6 +590,12 @@ impl View {
             ]
             .map(|key| self.t(key))
             .join(" · ");
+            if preset.post_sharpen && preset.filter != Filter::Cas {
+                subtitle.push_str(&format!(" + {}", self.t("post_sharpen")));
+            }
+            if preset.post_deband {
+                subtitle.push_str(&format!(" + {}", self.t("post_deband")));
+            }
             if !preset.crop.is_empty() {
                 let [l, t, r, b] = preset.crop.values();
                 subtitle.push_str(&format!(" · {} {l}/{t}/{r}/{b}", self.t("cropped")));
@@ -860,14 +866,58 @@ impl View {
         }
         device.set_model(Some(&model));
         device.set_selected(u32::from(!saved_device.is_empty()));
-        device.set_visible(preset.filter.uses_gpu());
-        filter.connect_selected_notify({
+
+        let sharpness = adw::SpinRow::with_range(0.0, 100.0, 5.0);
+        sharpness.set_title(&self.t("filter_sharpness"));
+        sharpness.set_subtitle(&self.t("filter_sharpness_hint"));
+        sharpness.set_value(f64::from(preset.sharpness));
+
+        let post_sharpen = adw::SwitchRow::builder()
+            .title(self.t("post_sharpen"))
+            .subtitle(self.t("post_sharpen_hint"))
+            .active(preset.post_sharpen)
+            .build();
+        let post_deband = adw::SwitchRow::builder()
+            .title(self.t("post_deband"))
+            .subtitle(self.t("post_deband_hint"))
+            .active(preset.post_deband)
+            .build();
+
+        let sync_gpu_controls = {
+            let filter = filter.downgrade();
             let device = device.downgrade();
-            move |row| {
-                if let Some(device) = device.upgrade() {
-                    device.set_visible(Filter::ALL[row.selected() as usize].uses_gpu());
-                }
+            let sharpness = sharpness.downgrade();
+            let post_sharpen = post_sharpen.downgrade();
+            let post_deband = post_deband.downgrade();
+            move || {
+                let (Some(filter), Some(device), Some(sharpness), Some(post_sharpen), Some(post_deband)) = (
+                    filter.upgrade(),
+                    device.upgrade(),
+                    sharpness.upgrade(),
+                    post_sharpen.upgrade(),
+                    post_deband.upgrade(),
+                ) else {
+                    return;
+                };
+                let selected = Filter::ALL[filter.selected() as usize];
+                let gpu = selected.uses_gpu();
+                device.set_visible(gpu);
+                post_sharpen.set_visible(gpu && selected != Filter::Cas);
+                post_deband.set_visible(gpu);
+                sharpness.set_visible(
+                    selected.supports_sharpness()
+                        || (gpu && selected != Filter::Cas && post_sharpen.is_active()),
+                );
             }
+        };
+        sync_gpu_controls();
+        filter.connect_selected_notify({
+            let sync = sync_gpu_controls.clone();
+            move |_| sync()
+        });
+        post_sharpen.connect_active_notify({
+            let sync = sync_gpu_controls.clone();
+            move |_| sync()
         });
         glib::spawn_future_local({
             let device = device.downgrade();
@@ -906,6 +956,9 @@ impl View {
             group.add(row);
         }
         group.add(&device);
+        group.add(&sharpness);
+        group.add(&post_sharpen);
+        group.add(&post_deband);
         let crop_expander = adw::ExpanderRow::builder()
             .title(self.t("crop"))
             .subtitle(self.t("crop_hint"))
@@ -973,6 +1026,9 @@ impl View {
                         crop_right.value() as u32,
                         crop_bottom.value() as u32,
                     ]),
+                    sharpness: sharpness.value().round().clamp(0.0, 100.0) as u32,
+                    post_sharpen: post_sharpen.is_active(),
+                    post_deband: post_deband.is_active(),
                 };
                 let result = view.settings.borrow_mut().save_preset(&id, &preset);
                 match result {
@@ -1286,18 +1342,14 @@ impl View {
             } else {
                 None
             };
-            Some(RenderUpscaler::new(
-                preset.filter,
-                &preset.render_device,
-                hint,
-            )?)
+            Some(RenderUpscaler::new(preset, hint)?)
         } else {
             None
         };
         let mut gpu = preset
             .filter
             .uses_gpu()
-            .then(|| GpuUpscaler::new(preset.filter))
+            .then(|| GpuUpscaler::new(preset.filter, preset.sharpness_f32()))
             .filter(|_| render_worker.is_none());
         viewport.update_property(&[gtk::accessible::Property::Label(&self.t("preview_image"))]);
         let mut toasts = None;

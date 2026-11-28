@@ -111,20 +111,25 @@ struct Program {
         if (id) {
             sampler = glGetUniformLocation(id, "inputImage");
             size = glGetUniformLocation(id, "outputSize");
+            sharpness = glGetUniformLocation(id, "sharpness");
         }
     }
 
-    void use(GLuint texture, const QSize &extent) const
+    void use(GLuint texture, const QSize &extent, float sharp = 0.8f) const
     {
         glUseProgram(id);
         glBindTexture(GL_TEXTURE_2D, texture);
         glUniform1i(sampler, 0);
         glUniform2f(size, extent.width(), extent.height());
+        if (sharpness >= 0) {
+            glUniform1f(sharpness, sharp);
+        }
     }
 
     GLuint id = 0;
     GLint sampler = -1;
     GLint size = -1;
+    GLint sharpness = -1;
 };
 
 struct Target {
@@ -312,11 +317,30 @@ private:
     GLint previous = 0;
 };
 
+QString workerFilterName(Filter filter)
+{
+    switch (filter) {
+    case Filter::Fsr: return QStringLiteral("fsr");
+    case Filter::Sgsr: return QStringLiteral("sgsr");
+    case Filter::Cas: return QStringLiteral("cas");
+    case Filter::SharpBilinear: return QStringLiteral("sharp-bilinear");
+    case Filter::Xbrz: return QStringLiteral("xbrz");
+    case Filter::Crt: return QStringLiteral("crt");
+    case Filter::Anime4k: return QStringLiteral("anime4k");
+    case Filter::Linear: return QStringLiteral("linear");
+    }
+    return QStringLiteral("linear");
+}
+
 class RenderWorker
 {
 public:
-    RenderWorker(QString device, std::function<void()> repaint)
-        : m_device(std::move(device)), m_repaint(std::move(repaint)) {}
+    RenderWorker(QString device, int sharpness, bool postSharpen, bool postDeband, std::function<void()> repaint)
+        : m_device(std::move(device))
+        , m_sharpness(std::clamp(sharpness, 0, 100))
+        , m_postSharpen(postSharpen)
+        , m_postDeband(postDeband)
+        , m_repaint(std::move(repaint)) {}
 
     ~RenderWorker()
     {
@@ -475,8 +499,7 @@ private:
         if (!m_shared) {
             return false;
         }
-        const auto name = filter == Filter::Anime4k ? QStringLiteral("anime4k")
-            : filter == Filter::Fsr ? QStringLiteral("fsr") : QStringLiteral("sgsr");
+        const auto name = workerFilterName(filter);
         m_process = std::make_unique<QProcess>();
         m_process->setProcessChannelMode(QProcess::ForwardedErrorChannel);
         QObject::connect(m_process.get(), &QProcess::readyReadStandardOutput, m_process.get(), m_repaint);
@@ -484,11 +507,17 @@ private:
         const QString hint = m_device.isEmpty() ? compositorRenderNode() : QString();
         m_deadline.start();
         m_process->start(QString::fromLatin1(WorkerPath),
-                         {QStringLiteral("--run"), name, m_device, hint, m_file.fileName(), QStringLiteral("flip")});
+                         {QStringLiteral("--run"), name, m_device, hint, m_file.fileName(),
+                          QStringLiteral("flip"), QString::number(m_sharpness),
+                          m_postSharpen ? QStringLiteral("1") : QStringLiteral("0"),
+                          m_postDeband ? QStringLiteral("1") : QStringLiteral("0")});
         return true;
     }
 
     QString m_device;
+    int m_sharpness = 80;
+    bool m_postSharpen = false;
+    bool m_postDeband = false;
     std::function<void()> m_repaint;
     QTemporaryFile m_file;
     uchar *m_shared = nullptr;
@@ -514,10 +543,16 @@ QPointF glPoint(const KWin::RenderViewport &viewport, const KWin::RenderTarget &
 }
 
 struct GpuPresentation::Pipeline {
-    Pipeline(Filter filter, const QString &device, std::function<void()> repaint) : filter(filter)
+    Pipeline(Filter filter, const QString &device, int sharpness, bool postSharpen,
+             bool postDeband, std::function<void()> repaint)
+        : filter(filter)
+        , sharpness(std::clamp(sharpness, 0, 100) / 100.0f)
     {
-        if (filter == Filter::Anime4k || !device.isEmpty()) {
-            worker = std::make_unique<RenderWorker>(device, std::move(repaint));
+        const bool needsWorker = (filter != Filter::Fsr && filter != Filter::Sgsr)
+            || !device.isEmpty() || postSharpen || postDeband;
+        if (needsWorker) {
+            worker = std::make_unique<RenderWorker>(device, sharpness, postSharpen, postDeband,
+                                                    std::move(repaint));
         }
     }
     ~Pipeline() { if (vao) glDeleteVertexArrays(1, &vao); }
@@ -550,11 +585,12 @@ struct GpuPresentation::Pipeline {
     {
         FramebufferBinding binding(destination.framebuffer.get());
         glViewport(0, 0, size.width(), size.height());
-        program.use(input, size);
+        program.use(input, size, sharpness);
         glDrawArrays(GL_TRIANGLES, 0, 3);
     }
 
     Filter filter;
+    float sharpness = 0.8f;
     std::unique_ptr<RenderWorker> worker;
     Program upscale, sharpen, present;
     Target source, intermediate, output;
@@ -563,8 +599,10 @@ struct GpuPresentation::Pipeline {
     const char *error = "interactive_filter_unavailable";
 };
 
-GpuPresentation::GpuPresentation(Filter filter, const QString &device, std::function<void()> repaint)
-    : m_pipeline(std::make_unique<Pipeline>(filter, device, std::move(repaint))) {}
+GpuPresentation::GpuPresentation(Filter filter, const QString &device, int sharpness,
+                                 bool postSharpen, bool postDeband, std::function<void()> repaint)
+    : m_pipeline(std::make_unique<Pipeline>(filter, device, sharpness, postSharpen, postDeband,
+                                            std::move(repaint))) {}
 GpuPresentation::~GpuPresentation() = default;
 
 bool GpuPresentation::workerAvailable()
@@ -626,8 +664,9 @@ bool GpuPresentation::paint(KWin::EffectWindow *window, const Presentation &pres
     if (!p.initialize()) {
         return false;
     }
+    const bool unrestricted = p.filter != Filter::Fsr && p.filter != Filter::Sgsr;
     const QSize processed = extent(sourceSize, destinationSize, p.worker ? std::min(8192, p.maxTexture) : p.maxTexture,
-                                   p.filter == Filter::Anime4k);
+                                   unrestricted);
     if (processed.isEmpty() || (p.worker && !fits(sourceSize))) {
         p.error = p.worker ? "render_size" : "interactive_filter_unavailable";
         return false;

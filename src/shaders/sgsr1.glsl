@@ -44,15 +44,12 @@ mediump float sgsrFastLanczos2(mediump float x)
 	wA *= wA;
 	return wB*wA;
 }
-// Above the reference 0.55 to narrow the kernel, so far taps cannot outvote a lone dark texel.
-const float sgsrKernelWidth = 0.8;
-
 // Outlier rejection fades in with tap distance, so the texel covering the pixel always votes.
-mediump float sgsrWeight(mediump float dx, mediump float dy, mediump float g, mediump float std)
+mediump float sgsrWeight(mediump float dx, mediump float dy, mediump float g, mediump float std, float kernelWidth)
 {
 	mediump float d2 = (dx*dx)+(dy*dy);
 	mediump float outlier = clamp(abs(g)*std, 0.0, 1.0) * min(d2 * 0.5, 1.0);
-	return sgsrFastLanczos2(d2 * sgsrKernelWidth + outlier);
+	return sgsrFastLanczos2(d2 * kernelWidth + outlier);
 }
 // Clamped to its own nearest 2x2, so shared weights cannot pull a channel out of range.
 mediump float sgsrChannel(mediump float w[12], mediump vec4 ud, mediump vec4 l, mediump vec4 r, mediump float invSum)
@@ -67,9 +64,12 @@ mediump float sgsrMean(mediump vec4 l, mediump vec4 r)
 	return (l.y+l.z+r.x+r.w)*0.25;
 }
 
-vec4 sampleSgsr1(sampler2D tex, vec2 uv)
+vec4 sampleSgsr1(sampler2D tex, vec2 uv, float sharpness)
 {
-	const float edgeThreshold = 8.0 / 255.0;
+	float s = clamp(sharpness, 0.0, 1.0);
+	// 0.8 reproduces the default kernel width of 0.80 and edge threshold of 8/255.
+	float kernelWidth = 0.55 + s * 0.3125;
+	float edgeThreshold = mix(16.0 / 255.0, 6.0 / 255.0, s);
 	mediump vec4 color = textureLod(tex, uv, 0.0);
 
 	vec2 size = vec2(textureSize(tex, 0));
@@ -102,18 +102,18 @@ vec4 sampleSgsr1(sampler2D tex, vec2 uv)
 			mediump float std = 2.181818/sum;
 
 			mediump float w[12];
-			w[0]  = sgsrWeight(pl.x,     pl.y+1.0, upDownG.x, std);
-			w[1]  = sgsrWeight(pl.x-1.0, pl.y+1.0, upDownG.y, std);
-			w[2]  = sgsrWeight(pl.x-1.0, pl.y-2.0, upDownG.z, std);
-			w[3]  = sgsrWeight(pl.x,     pl.y-2.0, upDownG.w, std);
-			w[4]  = sgsrWeight(pl.x+1.0, pl.y-1.0, leftG.x, std);
-			w[5]  = sgsrWeight(pl.x,     pl.y-1.0, leftG.y, std);
-			w[6]  = sgsrWeight(pl.x,     pl.y,     leftG.z, std);
-			w[7]  = sgsrWeight(pl.x+1.0, pl.y,     leftG.w, std);
-			w[8]  = sgsrWeight(pl.x-1.0, pl.y-1.0, rightG.x, std);
-			w[9]  = sgsrWeight(pl.x-2.0, pl.y-1.0, rightG.y, std);
-			w[10] = sgsrWeight(pl.x-2.0, pl.y,     rightG.z, std);
-			w[11] = sgsrWeight(pl.x-1.0, pl.y,     rightG.w, std);
+			w[0]  = sgsrWeight(pl.x,     pl.y+1.0, upDownG.x, std, kernelWidth);
+			w[1]  = sgsrWeight(pl.x-1.0, pl.y+1.0, upDownG.y, std, kernelWidth);
+			w[2]  = sgsrWeight(pl.x-1.0, pl.y-2.0, upDownG.z, std, kernelWidth);
+			w[3]  = sgsrWeight(pl.x,     pl.y-2.0, upDownG.w, std, kernelWidth);
+			w[4]  = sgsrWeight(pl.x+1.0, pl.y-1.0, leftG.x,   std, kernelWidth);
+			w[5]  = sgsrWeight(pl.x,     pl.y-1.0, leftG.y,   std, kernelWidth);
+			w[6]  = sgsrWeight(pl.x,     pl.y,     leftG.z,   std, kernelWidth);
+			w[7]  = sgsrWeight(pl.x+1.0, pl.y,     leftG.w,   std, kernelWidth);
+			w[8]  = sgsrWeight(pl.x-1.0, pl.y-1.0, rightG.x,  std, kernelWidth);
+			w[9]  = sgsrWeight(pl.x-2.0, pl.y-1.0, rightG.y,  std, kernelWidth);
+			w[10] = sgsrWeight(pl.x-2.0, pl.y,     rightG.z,  std, kernelWidth);
+			w[11] = sgsrWeight(pl.x-1.0, pl.y,     rightG.w,  std, kernelWidth);
 			mediump float invSum = 1.0 / (((w[0]+w[1])+(w[2]+w[3]))+((w[4]+w[5])+(w[6]+w[7]))+((w[8]+w[9])+(w[10]+w[11])));
 
 			// Green is centered on its mean, so its clamp window is centered too.

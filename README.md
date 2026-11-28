@@ -15,7 +15,7 @@ PicaLens 在不同 Wayland 桌面上分为两种工作方式：
 
 | 桌面 / 合成器 | 交互全屏 | 支持的 GPU 超分 | 说明与文档 |
 | --- | --- | --- | --- |
-| **KDE Plasma 6（KWin）** | 支持（内置） | 线性、FSR 1、SGSR、Anime4K | 安装包自动匹配 KWin 6.3.6 / 6.7.5；支持快捷键直放大活动窗口 · [Plasma 指南](docs/kwin-experiment.md) |
+| **KDE Plasma 6（KWin）** | 支持（内置） | 线性、FSR 1、SGSR、CAS、Sharp-Bilinear、xBRZ、CRT、Anime4K | 安装包自动匹配 KWin 6.3.6 / 6.7.5；支持快捷键直放大活动窗口 · [Plasma 指南](docs/kwin-experiment.md) |
 | **GNOME 51** | 支持（内置扩展） | 线性 | 启用随包安装的扩展即可交互操作原生 Wayland 窗口；XWayland 需可选组件 · [见下方说明](#gnome) |
 | **Hyprland 0.53.3** | 需专用插件 | 线性、FSR 1、SGSR | 未加载插件时可显式选择只读预览 · [Hyprland 指南](docs/hyprland-experiment.md) |
 | **niri 26.04** | 需独立 fork | 线性、FSR 1、SGSR | 原版暂不支持交互，可显式选择只读预览 · [niri 指南](docs/niri-experiment.md) |
@@ -55,12 +55,17 @@ sudo apt install ./picalens_0.2.1-1_amd64.deb
 | **线性 / 最近邻** | 基础 | 通用平滑缩放 / 保留硬边缘（最近邻走只读预览） |
 | **Lanczos 3** | CPU（后台线程） | 按预览物理像素重采样，适合文字和普通画面 |
 | **Scale2x** | CPU（后台线程） | 重建像素画斜边后以最近邻缩放；超过中间图像上限时回退为最近邻 |
-| **FSR 1** | GPU 着色器 | 复用 [Gamescope 着色器](https://github.com/ValveSoftware/gamescope/tree/7d957c518081c27e95b0f2d3501237abc62bf4f5/src/shaders)，含 EASU 放大 + RCAS 锐化两阶段 |
-| **SGSR** | GPU 着色器 | 复用 Gamescope 算法，单阶段空间超分 |
+| **FSR 1** | GPU 着色器 | 复用 [Gamescope 着色器](https://github.com/ValveSoftware/gamescope/tree/7d957c518081c27e95b0f2d3501237abc62bf4f5/src/shaders)，含 EASU 放大 + RCAS 锐化两阶段，支持调节锐化强度 |
+| **SGSR** | GPU 着色器 | 复用 Gamescope 算法，单阶段空间超分，支持调节锐化强度 |
+| **CAS（自适应锐化）** | GPU 着色器 | AMD FidelityFX CAS 对比度自适应锐化缩放，适合文字与通用画面，支持调节锐化强度 |
+| **Sharp-Bilinear** | GPU 着色器 | 像素画锐利双线性缩放，在非整数倍率下兼顾清晰边缘与均匀像素比例 |
+| **xBRZ** | GPU 着色器 | 任意倍率像素画平滑重建算法（Freescale 两阶段），适合经典像素游戏 |
+| **CRT（复古显像管）** | GPU 着色器 | CRT-Easymode 扫描线与孔栅遮罩滤镜，还原复古显示器观感 |
 | **Anime4K（轻量）** | GPU 着色器 | 复用 [Anime4K v4.0.1](https://github.com/bloc97/Anime4K/tree/v4.0.1)，组合高光限制、CNN 画面修复与按倍率启用的 2 倍超分 |
 
+- **滤镜参数与后处理**：在 **「缩放预设」** 中可调节 **锐化强度（0–100%，默认 80%）**，并可为任意 GPU 滤镜按需开启 **后处理锐化（CAS）** 与 **去色带（Deband）**（适合视觉小说渐变画面）。
 - **限制说明**：FSR 1 与 SGSR 着色器单边最多放大 2 倍，中间图像上限为 `3840×2160` 等量像素。启用交互全屏时，PicaLens 会自动检查后端与尺寸是否支持所选滤镜，不支持时会直接提示。
-- **指定渲染显卡**：在放大预设的 **「渲染显卡」** 中，可为 Anime4K、FSR 1、SGSR 指定执行滤镜的 GPU（下一次放大生效）。Plasma 6 需支持此特性的 OpenGL 后端；提供单窗流的桌面也可在 Portal 预览中使用。
+- **指定渲染显卡**：在放大预设的 **「渲染显卡」** 中，可为 GPU 滤镜指定执行设备（下一次放大生效）。Plasma 6 需支持此特性的 OpenGL 后端；提供单窗流的桌面也可在 Portal 预览中使用。
 
 ### 3. 通过 Gamescope 启动游戏
 

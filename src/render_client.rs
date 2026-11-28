@@ -15,7 +15,7 @@ use gtk::{gio, glib};
 use crate::{
     render_worker::{FRAME_BYTES, WORKER, frame_len},
     session::Result,
-    settings::Filter,
+    settings::Preset,
     upscale::{Pixels, ScaledFrame, Size},
 };
 
@@ -111,13 +111,16 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(filter: Filter, device: &str, hint: Option<PathBuf>) -> Result<Self> {
+    fn new(preset: &Preset, hint: Option<PathBuf>) -> Result<Self> {
         let shared = Shared::new()?;
+        let sharpness = preset.sharpness.min(100).to_string();
+        let post_sharpen = if preset.post_sharpen { "1" } else { "0" };
+        let post_deband = if preset.post_deband { "1" } else { "0" };
         let mut child = Command::new(worker_path())
-            .args(["--run", filter.id(), device])
+            .args(["--run", preset.filter.id(), &preset.render_device])
             .arg(hint.map_or_else(OsString::new, PathBuf::into_os_string))
             .arg(&shared.path)
-            .arg("native")
+            .args(["native", &sharpness, post_sharpen, post_deband])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
@@ -188,9 +191,9 @@ pub struct RenderUpscaler {
 }
 
 impl RenderUpscaler {
-    pub fn new(filter: Filter, selection: &str, hint: Option<PathBuf>) -> Result<Self> {
+    pub fn new(preset: &Preset, hint: Option<PathBuf>) -> Result<Self> {
         Ok(Self {
-            worker: Worker::new(filter, selection, hint)?,
+            worker: Worker::new(preset, hint)?,
             latest: None,
             submitted: None,
             in_flight: None,

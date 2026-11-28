@@ -237,7 +237,9 @@ public Q_SLOTS:
         if (effects->isOpenGLCompositing()) {
             QStringList filters{QStringLiteral("linear"), QStringLiteral("fsr"), QStringLiteral("sgsr")};
             if (PicaLens::GpuPresentation::workerAvailable()) {
-                filters.append(QStringLiteral("anime4k"));
+                filters.append({QStringLiteral("cas"), QStringLiteral("sharp-bilinear"),
+                                QStringLiteral("xbrz"), QStringLiteral("crt"),
+                                QStringLiteral("anime4k")});
             }
             return filters;
         }
@@ -309,14 +311,16 @@ public Q_SLOTS:
     {
         const auto parsed = parseStartOptions(options);
         return parsed && startSelection(parsed->layout, parsed->filter, parsed->renderDevice,
-                                        parsed->crop, parsed->hideCursorMs);
+                                        parsed->crop, parsed->hideCursorMs, parsed->sharpness,
+                                        parsed->postSharpen, parsed->postDeband);
     }
 
     Q_SCRIPTABLE bool StartActiveWithOptions(const QVariantMap &options)
     {
         const auto parsed = parseStartOptions(options);
         return parsed && startActive(parsed->layout, parsed->filter, parsed->renderDevice,
-                                     parsed->crop, parsed->hideCursorMs);
+                                     parsed->crop, parsed->hideCursorMs, parsed->sharpness,
+                                     parsed->postSharpen, parsed->postDeband);
     }
 
     Q_SCRIPTABLE bool CaptureScreenshot(const QString &path)
@@ -349,6 +353,9 @@ private:
         QString renderDevice;
         PicaLens::Crop crop;
         int hideCursorMs = 0;
+        int sharpness = 80;
+        bool postSharpen = false;
+        bool postDeband = false;
     };
 
     bool callerIsOwner() const
@@ -399,13 +406,18 @@ private:
         if (parsed.renderDevice.size() > 512) {
             return std::nullopt;
         }
-        const bool needsWorker = parsed.filter == PicaLens::Filter::Anime4k
-            || (parsed.filter != PicaLens::Filter::Linear && !parsed.renderDevice.isEmpty());
+        const bool workerOnly = parsed.filter != PicaLens::Filter::Linear
+            && parsed.filter != PicaLens::Filter::Fsr && parsed.filter != PicaLens::Filter::Sgsr;
+        parsed.postSharpen = options.value(QStringLiteral("postSharpen"), false).toBool();
+        parsed.postDeband = options.value(QStringLiteral("postDeband"), false).toBool();
+        const bool needsWorker = workerOnly
+            || (parsed.filter != PicaLens::Filter::Linear
+                && (!parsed.renderDevice.isEmpty() || parsed.postSharpen || parsed.postDeband));
         if (needsWorker && RenderWorkerVersion() != 1) {
             return std::nullopt;
         }
-        auto clampInt = [&](const char *key, int maxValue) {
-            return std::clamp(options.value(QString::fromLatin1(key)).toInt(), 0, maxValue);
+        auto clampInt = [&](const char *key, int maxValue, int defaultValue = 0) {
+            return std::clamp(options.value(QString::fromLatin1(key), defaultValue).toInt(), 0, maxValue);
         };
         parsed.crop = PicaLens::Crop{
             clampInt("cropLeft", 4096),
@@ -414,17 +426,19 @@ private:
             clampInt("cropBottom", 4096),
         };
         parsed.hideCursorMs = clampInt("hideCursorMs", 60000);
+        parsed.sharpness = clampInt("sharpness", 100, 80);
         return parsed;
     }
 
     bool startActive(const QString &layout, PicaLens::Filter filter, const QString &device = {})
     {
         const auto parsed = parseLayout(layout);
-        return parsed && startActive(*parsed, filter, device, {}, 0);
+        return parsed && startActive(*parsed, filter, device, {}, 0, 80, false, false);
     }
 
     bool startActive(PicaLens::Layout layout, PicaLens::Filter filter, const QString &device,
-                     PicaLens::Crop crop, int hideCursorMs)
+                     PicaLens::Crop crop, int hideCursorMs, int sharpness, bool postSharpen,
+                     bool postDeband)
     {
         if (!canStart()) {
             return false;
@@ -439,6 +453,9 @@ private:
         m_renderDevice = device;
         m_crop = crop;
         m_hideCursorMs = hideCursorMs;
+        m_sharpness = sharpness;
+        m_postSharpen = postSharpen;
+        m_postDeband = postDeband;
         return start(window);
     }
 
@@ -447,6 +464,10 @@ private:
         switch (filter) {
         case PicaLens::Filter::Fsr: return QStringLiteral("fsr");
         case PicaLens::Filter::Sgsr: return QStringLiteral("sgsr");
+        case PicaLens::Filter::Cas: return QStringLiteral("cas");
+        case PicaLens::Filter::SharpBilinear: return QStringLiteral("sharp-bilinear");
+        case PicaLens::Filter::Xbrz: return QStringLiteral("xbrz");
+        case PicaLens::Filter::Crt: return QStringLiteral("crt");
         case PicaLens::Filter::Anime4k: return QStringLiteral("anime4k");
         case PicaLens::Filter::Linear: return QStringLiteral("linear");
         }
@@ -455,7 +476,10 @@ private:
 
     static std::optional<PicaLens::Filter> parseGpuFilter(const QString &name)
     {
-        for (const auto filter : {PicaLens::Filter::Fsr, PicaLens::Filter::Sgsr, PicaLens::Filter::Anime4k}) {
+        for (const auto filter : {PicaLens::Filter::Fsr, PicaLens::Filter::Sgsr,
+                                  PicaLens::Filter::Cas, PicaLens::Filter::SharpBilinear,
+                                  PicaLens::Filter::Xbrz, PicaLens::Filter::Crt,
+                                  PicaLens::Filter::Anime4k}) {
             if (filterName(filter) == name) {
                 return filter;
             }
@@ -485,7 +509,8 @@ private:
     }
 
     bool startSelection(PicaLens::Layout layout, PicaLens::Filter filter = PicaLens::Filter::Linear,
-                        const QString &device = {}, PicaLens::Crop crop = {}, int hideCursorMs = 0)
+                        const QString &device = {}, PicaLens::Crop crop = {}, int hideCursorMs = 0,
+                        int sharpness = 80, bool postSharpen = false, bool postDeband = false)
     {
         if (!canStart() || !effects->grabKeyboard(this)) {
             return false;
@@ -496,6 +521,9 @@ private:
         m_renderDevice = device;
         m_crop = crop;
         m_hideCursorMs = hideCursorMs;
+        m_sharpness = sharpness;
+        m_postSharpen = postSharpen;
+        m_postDeband = postDeband;
         m_selecting = true;
         effects->startMouseInterception(this, Qt::CrossCursor);
         qInfo("picalens selecting an existing window");
@@ -675,11 +703,12 @@ private:
         m_presentation = presentation;
         source->refOffscreenRendering();
         if (m_filter != PicaLens::Filter::Linear) {
-            m_gpu = std::make_unique<PicaLens::GpuPresentation>(m_filter, m_renderDevice, [this] {
-                if (m_presentation) {
-                    repaintOutput(m_presentation->outputRect);
-                }
-            });
+            m_gpu = std::make_unique<PicaLens::GpuPresentation>(
+                m_filter, m_renderDevice, m_sharpness, m_postSharpen, m_postDeband, [this] {
+                    if (m_presentation) {
+                        repaintOutput(m_presentation->outputRect);
+                    }
+                });
             if (!m_gpu->hasFrame()) {
                 m_input.blockOutput(m_presentation->outputRect);
                 m_renderGrab = effects->grabKeyboard(this);
@@ -751,6 +780,9 @@ private:
         m_cursorIdleTimer.stop();
         showIdleCursor();
         m_hideCursorMs = 0;
+        m_sharpness = 80;
+        m_postSharpen = false;
+        m_postDeband = false;
         m_crop = {};
         m_renderPoll.stop();
         finishRenderWait();
@@ -810,6 +842,9 @@ private:
     QString m_pendingScreenshotPath;
     QPointF m_lastCursorPos;
     int m_hideCursorMs = 0;
+    int m_sharpness = 80;
+    bool m_postSharpen = false;
+    bool m_postDeband = false;
     std::unique_ptr<PicaLens::GpuPresentation> m_gpu;
     bool m_registered = false;
     bool m_selecting = false;

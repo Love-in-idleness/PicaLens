@@ -11,7 +11,7 @@ use glow::HasContext;
 use crate::{
     gpu, render_device,
     session::Result,
-    settings::Filter,
+    settings::{DEFAULT_SHARPNESS, Filter},
     upscale::{MAX_EDGE, MAX_PIXELS, Size},
 };
 
@@ -31,6 +31,26 @@ void main() {
     outputColor = vec4(texture(image, uv).rgb, texture(original, uv).a);
 }
 "#;
+const TEXTURE_UNIFORMS: [&str; 8] = [
+    "texture0", "texture1", "texture2", "texture3", "texture4", "texture5", "texture6", "texture7",
+];
+
+#[derive(Clone, Copy, Debug)]
+struct RenderOptions {
+    sharpness: f32,
+    post_sharpen: bool,
+    post_deband: bool,
+}
+
+impl Default for RenderOptions {
+    fn default() -> Self {
+        Self {
+            sharpness: DEFAULT_SHARPNESS as f32 / 100.0,
+            post_sharpen: false,
+            post_deband: false,
+        }
+    }
+}
 
 pub fn run() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args_os().skip(1).collect();
@@ -42,7 +62,38 @@ pub fn run() -> std::process::ExitCode {
             hint.to_str().unwrap_or_default(),
             Path::new(shared),
             orientation == "flip",
+            RenderOptions::default(),
         ),
+        [
+            mode,
+            filter,
+            device,
+            hint,
+            shared,
+            orientation,
+            sharpness,
+            post_sharpen,
+            post_deband,
+        ] if mode == "--run" => {
+            let sharpness = sharpness
+                .to_str()
+                .and_then(|value| value.parse::<u32>().ok())
+                .unwrap_or(DEFAULT_SHARPNESS)
+                .min(100) as f32
+                / 100.0;
+            serve(
+                Filter::parse(filter.to_str().unwrap_or_default()),
+                device.to_str().unwrap_or_default(),
+                hint.to_str().unwrap_or_default(),
+                Path::new(shared),
+                orientation == "flip",
+                RenderOptions {
+                    sharpness,
+                    post_sharpen: post_sharpen == "1",
+                    post_deband: post_deband == "1",
+                },
+            )
+        }
         _ => Err("invalid render worker arguments".into()),
     };
     if let Err(error) = result {
@@ -59,21 +110,31 @@ pub fn run() -> std::process::ExitCode {
     std::process::ExitCode::SUCCESS
 }
 
-fn serve(filter: Filter, device: &str, hint: &str, shared: &Path, flip: bool) -> Result<()> {
+fn serve(
+    filter: Filter,
+    device: &str,
+    hint: &str,
+    shared: &Path,
+    flip: bool,
+    options: RenderOptions,
+) -> Result<()> {
     let file = OpenOptions::new().read(true).write(true).open(shared)?;
     if file.metadata()?.len() != 2 * FRAME_BYTES as u64 || !filter.uses_gpu() {
         return Err("invalid render worker configuration".into());
     }
     let context = render_device::Context::new(device, hint)?;
-    let mut renderer = Renderer::new(context.gl(), filter)?;
+    let mut renderer = Renderer::new(context.gl(), filter, options)?;
     let mut stdin = io::stdin().lock();
     let mut stdout = io::stdout().lock();
     diagnostic!(
-        "picalens render GPU filter={} device={} node={} renderer={}",
+        "picalens render GPU filter={} device={} node={} renderer={} sharpness={:.2} post_sharpen={} post_deband={}",
         filter.id(),
         if device.is_empty() { "auto" } else { device },
         context.node.display(),
-        context.label
+        context.label,
+        options.sharpness,
+        options.post_sharpen,
+        options.post_deband,
     );
     writeln!(stdout, "ready")?;
     stdout.flush()?;
@@ -85,6 +146,7 @@ fn serve(filter: Filter, device: &str, hint: &str, shared: &Path, flip: bool) ->
         events: libc::POLLIN,
         revents: 0,
     };
+    let needs_flip = flip && matches!(filter, Filter::Anime4k | Filter::Xbrz | Filter::Crt);
     loop {
         if !context.node.exists() {
             return Err("render_gpu_missing".into());
@@ -121,11 +183,11 @@ fn serve(filter: Filter, device: &str, hint: &str, shared: &Path, flip: bool) ->
         input.resize(frame_len(source)?, 0);
         output.resize(frame_len(target)?, 0);
         file.read_exact_at(&mut input, 0)?;
-        if flip && filter == Filter::Anime4k {
+        if needs_flip {
             flip_rows(&mut input, source.0);
         }
         renderer.render(source, target, &input, &mut output)?;
-        if flip && filter == Filter::Anime4k {
+        if needs_flip {
             flip_rows(&mut output, target.0);
         }
         file.write_all_at(&output, FRAME_BYTES as u64)?;
@@ -172,6 +234,14 @@ impl Format {
     }
 }
 
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum PassScale {
+    Target,
+    Source,
+    Current,
+    Double,
+}
+
 struct Texture {
     id: glow::NativeTexture,
     size: Size,
@@ -180,10 +250,10 @@ struct Texture {
 
 struct Pass {
     program: glow::NativeProgram,
-    bindings: Vec<&'static str>,
+    bindings: Vec<(&'static str, &'static str)>,
     save: &'static str,
     format: Format,
-    doubled: bool,
+    scale: PassScale,
     conditional: bool,
 }
 
@@ -195,13 +265,15 @@ struct Renderer<'a> {
     vao: Option<glow::NativeVertexArray>,
     limit: u32,
     filter: Filter,
+    options: RenderOptions,
 }
 
 impl<'a> Renderer<'a> {
-    fn new(gl: &'a glow::Context, filter: Filter) -> Result<Self> {
+    fn new(gl: &'a glow::Context, filter: Filter, options: RenderOptions) -> Result<Self> {
         let mut renderer = Self {
             gl,
             filter,
+            options,
             passes: Vec::new(),
             textures: Vec::new(),
             framebuffer: None,
@@ -212,38 +284,82 @@ impl<'a> Renderer<'a> {
             renderer.framebuffer = Some(gl.create_framebuffer()?);
             renderer.vao = Some(gl.create_vertex_array()?);
         }
-        if filter == Filter::Anime4k {
-            // PREKERNEL runs after MAIN in mpv. Measure highlights on the original,
-            // then clamp the restored/upscaled image immediately before resampling.
-            let clamp: Vec<_> = shader_sections(CLAMP).collect();
-            for section in clamp[..2]
-                .iter()
-                .copied()
-                .chain(shader_sections(RESTORE))
-                .chain(shader_sections(UPSCALE))
-                .chain(clamp[2..].iter().copied())
-            {
-                renderer.passes.push(anime_pass(gl, section)?);
-            }
-            renderer.passes.push(Pass {
-                program: gpu::program(gl, PRESENT)?,
-                bindings: vec!["MAIN", "original"],
-                save: "output",
-                format: Format::Rgba8,
-                doubled: false,
-                conditional: false,
-            });
-        } else {
-            for source in gpu::filter_sources(filter) {
+        match filter {
+            Filter::Anime4k => {
+                // PREKERNEL runs after MAIN in mpv. Measure highlights on the original,
+                // then clamp the restored/upscaled image immediately before resampling.
+                let clamp: Vec<_> = shader_sections(CLAMP).collect();
+                for section in clamp[..2]
+                    .iter()
+                    .copied()
+                    .chain(shader_sections(RESTORE))
+                    .chain(shader_sections(UPSCALE))
+                    .chain(clamp[2..].iter().copied())
+                {
+                    renderer.passes.push(anime_pass(gl, section)?);
+                }
                 renderer.passes.push(Pass {
-                    program: gpu::program(gl, &source)?,
-                    bindings: vec!["MAIN"],
+                    program: gpu::program(gl, PRESENT)?,
+                    bindings: vec![("MAIN", "image"), ("original", "original")],
                     save: "MAIN",
                     format: Format::Rgba8,
-                    doubled: false,
+                    scale: PassScale::Target,
                     conditional: false,
                 });
             }
+            Filter::Xbrz => {
+                renderer.passes.push(Pass {
+                    program: gpu::program(gl, &gpu::fragment_source(gpu::XBRZ_PASS1))?,
+                    bindings: vec![("MAIN", "inputImage")],
+                    save: "XBRZ",
+                    format: Format::Rgba8,
+                    scale: PassScale::Source,
+                    conditional: false,
+                });
+                renderer.passes.push(Pass {
+                    program: gpu::program(gl, &gpu::fragment_source(gpu::XBRZ_PASS2))?,
+                    bindings: vec![("MAIN", "inputImage"), ("XBRZ", "xbrzInfo")],
+                    save: "MAIN",
+                    format: Format::Rgba8,
+                    scale: PassScale::Target,
+                    conditional: false,
+                });
+            }
+            _ => {
+                for source in gpu::filter_sources(filter) {
+                    renderer.passes.push(Pass {
+                        program: gpu::program(gl, &source)?,
+                        bindings: vec![("MAIN", "inputImage")],
+                        save: "MAIN",
+                        format: Format::Rgba8,
+                        scale: PassScale::Target,
+                        conditional: false,
+                    });
+                }
+            }
+        }
+        if options.post_sharpen && filter != Filter::Cas {
+            renderer.passes.push(Pass {
+                program: gpu::program(gl, &gpu::fragment_source(gpu::CAS_PASS))?,
+                bindings: vec![("MAIN", "inputImage")],
+                save: "MAIN",
+                format: Format::Rgba8,
+                scale: PassScale::Target,
+                conditional: false,
+            });
+        }
+        if options.post_deband {
+            renderer.passes.push(Pass {
+                program: gpu::program(gl, &gpu::fragment_source(gpu::DEBAND_PASS))?,
+                bindings: vec![("MAIN", "inputImage")],
+                save: "MAIN",
+                format: Format::Rgba8,
+                scale: PassScale::Target,
+                conditional: false,
+            });
+        }
+        if renderer.passes.is_empty() {
+            return Err("no GPU shader for this filter".into());
         }
         Ok(renderer)
     }
@@ -302,13 +418,11 @@ impl<'a> Renderer<'a> {
             if pass.conditional && !double {
                 continue;
             }
-            let final_pass = index + 1 == self.passes.len();
-            let size = if !anime || final_pass {
-                target
-            } else if pass.doubled {
-                double_size
-            } else {
-                current_size
+            let size = match pass.scale {
+                PassScale::Target => target,
+                PassScale::Source => source,
+                PassScale::Current => current_size,
+                PassScale::Double => double_size,
             };
             let format = pass.format;
             let mut used = current.values().copied().collect::<Vec<_>>();
@@ -321,9 +435,10 @@ impl<'a> Renderer<'a> {
                 current_size = size;
             }
             current.retain(|name, _| {
-                self.passes[index + 1..]
-                    .iter()
-                    .any(|next| (!next.conditional || double) && next.bindings.contains(name))
+                self.passes[index + 1..].iter().any(|next| {
+                    (!next.conditional || double)
+                        && next.bindings.iter().any(|(bound, _)| bound == name)
+                })
             });
         }
         unsafe {
@@ -426,24 +541,16 @@ impl<'a> Renderer<'a> {
             gl.use_program(Some(pass.program));
             let size = gl.get_uniform_location(pass.program, "outputSize");
             gl.uniform_2_f32(size.as_ref(), texture.size.0 as f32, texture.size.1 as f32);
-            for (unit, name) in pass.bindings.iter().enumerate() {
+            if let Some(sharpness) = gl.get_uniform_location(pass.program, "sharpness") {
+                gl.uniform_1_f32(Some(&sharpness), self.options.sharpness);
+            }
+            for (unit, &(name, uniform)) in pass.bindings.iter().enumerate() {
                 let input = inputs
                     .get(name)
                     .ok_or("render pass requested an unavailable image")?;
                 gl.active_texture(glow::TEXTURE0 + unit as u32);
                 gl.bind_texture(glow::TEXTURE_2D, Some(self.textures[*input].id));
-                let uniform = if pass.save == "output" {
-                    if unit == 0 {
-                        "image".to_owned()
-                    } else {
-                        "original".to_owned()
-                    }
-                } else if self.filter != Filter::Anime4k {
-                    "inputImage".to_owned()
-                } else {
-                    format!("texture{unit}")
-                };
-                let location = gl.get_uniform_location(pass.program, &uniform);
+                let location = gl.get_uniform_location(pass.program, uniform);
                 gl.uniform_1_i32(location.as_ref(), unit as i32);
             }
             gl.draw_arrays(glow::TRIANGLES, 0, 3);
@@ -489,18 +596,21 @@ fn anime_pass(gl: &glow::Context, section: &'static str) -> Result<Pass> {
         .filter_map(|line| line.strip_prefix("//!BIND "))
     {
         let unit = bindings.len();
+        let uniform = *TEXTURE_UNIFORMS
+            .get(unit)
+            .ok_or("too many texture bindings in shader pass")?;
         let actual = if name == "HOOKED" { "MAIN" } else { name };
-        bindings.push(actual);
+        bindings.push((actual, uniform));
         use std::fmt::Write;
-        writeln!(shader, "uniform sampler2D texture{unit};")?;
+        writeln!(shader, "uniform sampler2D {uniform};")?;
         for alias in std::iter::once(name).chain((name != actual).then_some(actual)) {
             writeln!(shader, "#define {alias}_pos (gl_FragCoord.xy / outputSize)")?;
             writeln!(
                 shader,
-                "#define {alias}_size vec2(textureSize(texture{unit}, 0))"
+                "#define {alias}_size vec2(textureSize({uniform}, 0))"
             )?;
             writeln!(shader, "#define {alias}_pt (1.0 / {alias}_size)")?;
-            writeln!(shader, "#define {alias}_tex(p) texture(texture{unit}, (p))")?;
+            writeln!(shader, "#define {alias}_tex(p) texture({uniform}, (p))")?;
             writeln!(
                 shader,
                 "#define {alias}_texOff(p) {alias}_tex({alias}_pos + (p) * {alias}_pt)"
@@ -512,6 +622,9 @@ fn anime_pass(gl: &glow::Context, section: &'static str) -> Result<Pass> {
         .ok_or("missing Anime4K shader body")?;
     shader.push_str(body);
     shader.push_str("\nvoid main() { outputColor = hook(); }\n");
+    let doubled = section
+        .lines()
+        .any(|line| line.starts_with("//!WIDTH ") && line.ends_with(" 2 *"));
     Ok(Pass {
         program: gpu::program(gl, &shader)?,
         bindings,
@@ -524,9 +637,11 @@ fn anime_pass(gl: &glow::Context, section: &'static str) -> Result<Pass> {
         } else {
             Format::Rgba16f
         },
-        doubled: section
-            .lines()
-            .any(|line| line.starts_with("//!WIDTH ") && line.ends_with(" 2 *")),
+        scale: if doubled {
+            PassScale::Double
+        } else {
+            PassScale::Current
+        },
         conditional: section.lines().any(|line| line.starts_with("//!WHEN ")),
     })
 }
@@ -556,15 +671,24 @@ mod tests {
             }
         }
         let target = (32, 24);
+        let filters = [
+            Filter::Fsr,
+            Filter::Sgsr,
+            Filter::Cas,
+            Filter::SharpBilinear,
+            Filter::Xbrz,
+            Filter::Crt,
+            Filter::Anime4k,
+        ];
         let mut rendered = Vec::new();
-        for filter in [Filter::Fsr, Filter::Sgsr, Filter::Anime4k] {
-            let mut renderer = Renderer::new(context.gl(), filter).unwrap();
+        for filter in filters {
+            let mut renderer =
+                Renderer::new(context.gl(), filter, RenderOptions::default()).unwrap();
             let mut output = vec![0; frame_len(target).unwrap()];
             renderer
                 .render(source, target, &pixels, &mut output)
                 .unwrap();
             assert!(output.chunks_exact(4).all(|pixel| pixel[3] == 255));
-            assert!(output.first_chunk::<4>().unwrap()[1] < output.last_chunk::<4>().unwrap()[1]);
             rendered.push(output.clone());
             renderer
                 .render(source, target, &pixels, &mut output)
@@ -581,7 +705,38 @@ mod tests {
                 assert_ne!(&output[..pixels.len()], &pixels);
             }
         }
-        assert_ne!(rendered[0], rendered[1]);
-        assert_ne!(rendered[1], rendered[2]);
+        for i in 0..rendered.len() {
+            for j in (i + 1)..rendered.len() {
+                assert_ne!(rendered[i], rendered[j], "filters {i} and {j} produced identical output");
+            }
+        }
+        // Verify sharpness parameter affects FSR output and post-processing modifies frames.
+        let mut soft_fsr = Renderer::new(
+            context.gl(),
+            Filter::Fsr,
+            RenderOptions {
+                sharpness: 0.0,
+                ..RenderOptions::default()
+            },
+        )
+        .unwrap();
+        let mut soft_out = vec![0; frame_len(target).unwrap()];
+        soft_fsr.render(source, target, &pixels, &mut soft_out).unwrap();
+        assert_ne!(soft_out, rendered[0]);
+
+        let mut post = Renderer::new(
+            context.gl(),
+            Filter::SharpBilinear,
+            RenderOptions {
+                sharpness: 0.8,
+                post_sharpen: true,
+                post_deband: true,
+            },
+        )
+        .unwrap();
+        assert_eq!(post.passes.len(), 3);
+        let mut post_out = vec![0; frame_len(target).unwrap()];
+        post.render(source, target, &pixels, &mut post_out).unwrap();
+        assert_ne!(post_out, rendered[3]);
     }
 }

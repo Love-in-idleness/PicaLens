@@ -10,12 +10,13 @@
 namespace PicaLens
 {
 
-enum class Filter { Linear, Fsr, Sgsr, Anime4k };
+enum class Filter { Linear, Fsr, Sgsr, Cas, SharpBilinear, Xbrz, Crt, Anime4k };
 
 class GpuPresentation
 {
 public:
-    GpuPresentation(Filter filter, const QString &device, std::function<void()> repaint);
+    GpuPresentation(Filter filter, const QString &device, int sharpness, bool postSharpen,
+                    bool postDeband, std::function<void()> repaint);
     ~GpuPresentation();
     static bool workerAvailable();
     bool paint(KWin::EffectWindow *window, const Presentation &presentation,

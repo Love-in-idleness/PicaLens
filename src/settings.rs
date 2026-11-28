@@ -23,14 +23,48 @@ macro_rules! choices {
 }
 
 choices!(Layout { Fit => "fit", Fill => "fill", Stretch => "stretch", Integer => "integer" });
-choices!(Filter { Linear => "linear", Nearest => "nearest", Lanczos => "lanczos", Scale2x => "scale2x", Fsr => "fsr", Sgsr => "sgsr", Anime4k => "anime4k" });
+choices!(Filter {
+    Linear => "linear",
+    Nearest => "nearest",
+    Lanczos => "lanczos",
+    Scale2x => "scale2x",
+    Fsr => "fsr",
+    Sgsr => "sgsr",
+    Cas => "cas",
+    SharpBilinear => "sharp-bilinear",
+    Xbrz => "xbrz",
+    Crt => "crt",
+    Anime4k => "anime4k",
+});
 choices!(Presentation { Fullscreen => "fullscreen", Windowed => "windowed", Preview => "preview" });
 choices!(Language { System => "system", English => "en", Chinese => "zh-CN", Japanese => "ja" });
 choices!(Theme { System => "system", Light => "light", Dark => "dark" });
 
+pub const DEFAULT_SHARPNESS: u32 = 80;
+
 impl Filter {
     pub fn uses_gpu(self) -> bool {
-        matches!(self, Self::Fsr | Self::Sgsr | Self::Anime4k)
+        matches!(
+            self,
+            Self::Fsr
+                | Self::Sgsr
+                | Self::Cas
+                | Self::SharpBilinear
+                | Self::Xbrz
+                | Self::Crt
+                | Self::Anime4k
+        )
+    }
+
+    pub fn requires_render_worker(self) -> bool {
+        matches!(
+            self,
+            Self::Anime4k | Self::Cas | Self::SharpBilinear | Self::Xbrz | Self::Crt
+        )
+    }
+
+    pub fn supports_sharpness(self) -> bool {
+        matches!(self, Self::Fsr | Self::Sgsr | Self::Cas)
     }
 }
 
@@ -79,7 +113,7 @@ impl Crop {
     pub const MIN_VISIBLE: u32 = 16;
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Preset {
     pub name: String,
     pub layout: Layout,
@@ -87,11 +121,40 @@ pub struct Preset {
     pub presentation: Presentation,
     pub render_device: String,
     pub crop: Crop,
+    pub sharpness: u32,
+    pub post_sharpen: bool,
+    pub post_deband: bool,
+}
+
+impl Default for Preset {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            layout: Layout::default(),
+            filter: Filter::default(),
+            presentation: Presentation::default(),
+            render_device: String::new(),
+            crop: Crop::default(),
+            sharpness: DEFAULT_SHARPNESS,
+            post_sharpen: false,
+            post_deband: false,
+        }
+    }
 }
 
 impl Preset {
+    pub fn has_post_processing(&self) -> bool {
+        self.post_sharpen || self.post_deband
+    }
+
     pub fn uses_render_worker(&self) -> bool {
-        self.filter == Filter::Anime4k || (self.filter.uses_gpu() && !self.render_device.is_empty())
+        self.filter.requires_render_worker()
+            || (self.filter.uses_gpu()
+                && (!self.render_device.is_empty() || self.has_post_processing()))
+    }
+
+    pub fn sharpness_f32(&self) -> f32 {
+        self.sharpness.min(100) as f32 / 100.0
     }
 }
 
@@ -196,6 +259,13 @@ impl Settings {
             crop: Crop::from_values(
                 Crop::KEYS.map(|key| self.file.integer(&group, key).unwrap_or(0).max(0) as u32),
             ),
+            sharpness: self
+                .file
+                .integer(&group, "sharpness")
+                .map(|value| value.clamp(0, 100) as u32)
+                .unwrap_or(DEFAULT_SHARPNESS),
+            post_sharpen: self.file.boolean(&group, "post-sharpen").unwrap_or(false),
+            post_deband: self.file.boolean(&group, "post-deband").unwrap_or(false),
         }
     }
 
@@ -212,6 +282,22 @@ impl Settings {
                     let _ = file.remove_key(&group, key);
                 } else {
                     file.set_integer(&group, key, value as i32);
+                }
+            }
+            let sharpness = preset.sharpness.min(100);
+            if sharpness == DEFAULT_SHARPNESS {
+                let _ = file.remove_key(&group, "sharpness");
+            } else {
+                file.set_integer(&group, "sharpness", sharpness as i32);
+            }
+            for (key, enabled) in [
+                ("post-sharpen", preset.post_sharpen),
+                ("post-deband", preset.post_deband),
+            ] {
+                if enabled {
+                    file.set_boolean(&group, key, true);
+                } else {
+                    let _ = file.remove_key(&group, key);
                 }
             }
         })
@@ -372,7 +458,11 @@ mod tests {
         assert!(!settings.inhibit_idle());
         let preset = Preset {
             name: "VN".into(),
+            filter: Filter::Xbrz,
             crop: Crop::from_values([4, 30, 4, 9000]),
+            sharpness: 65,
+            post_sharpen: true,
+            post_deband: true,
             ..Preset::default()
         };
         settings.save_preset("vn", &preset).unwrap();
@@ -383,8 +473,14 @@ mod tests {
         settings.set_screenshot_dir("/tmp/shots").unwrap();
 
         let mut settings = Settings::open(&path);
-        let crop = settings.preset("vn").crop;
-        assert_eq!(crop.values(), [4, 30, 4, Crop::MAX]);
+        let saved = settings.preset("vn");
+        assert_eq!(saved.filter, Filter::Xbrz);
+        assert_eq!(saved.crop.values(), [4, 30, 4, Crop::MAX]);
+        assert_eq!(saved.sharpness, 65);
+        assert!(saved.post_sharpen);
+        assert!(saved.post_deband);
+        assert!(saved.uses_render_worker());
+        assert_eq!(settings.preset(DEFAULT_ID).sharpness, DEFAULT_SHARPNESS);
         assert_eq!(settings.preset_for_app("muramasa_chs.exe").as_deref(), Some("vn"));
         assert_eq!(settings.preset_for_app("MURAMASA_CHS.EXE.desktop").as_deref(), Some("vn"));
         assert_eq!(settings.preset_for_app("org.kde.dolphin"), None);

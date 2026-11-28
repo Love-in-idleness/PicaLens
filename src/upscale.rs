@@ -138,7 +138,7 @@ pub fn processing_size(filter: Filter, source: Size, target: Size) -> Option<Siz
     if w == 0 || h == 0 {
         return None;
     }
-    if filter == Filter::Anime4k {
+    if filter.requires_render_worker() {
         return Some(bounded_size(target, 1.0));
     }
     if source == target {

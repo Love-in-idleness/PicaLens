@@ -157,10 +157,8 @@ impl Viewport {
         let [x, y, w, h] = layout;
         let area = graphene::Rect::new(x as f32, y as f32, w as f32, h as f32);
         let filter = match self.imp().filter.get() {
-            Filter::Linear | Filter::Lanczos | Filter::Fsr | Filter::Sgsr | Filter::Anime4k => {
-                gsk::ScalingFilter::Linear
-            }
             Filter::Nearest | Filter::Scale2x => gsk::ScalingFilter::Nearest,
+            _ => gsk::ScalingFilter::Linear,
         };
         let source = size(frame);
         let target = self.scaled_size(source, layout, scale);

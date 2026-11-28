@@ -133,6 +133,9 @@ fn gio_options(preset: &Preset, hide_cursor_seconds: u32) -> glib::Variant {
     dict.insert("cropRight", preset.crop.right as i32);
     dict.insert("cropBottom", preset.crop.bottom as i32);
     dict.insert("hideCursorMs", hide_cursor_seconds.saturating_mul(1000) as i32);
+    dict.insert("sharpness", preset.sharpness.min(100) as i32);
+    dict.insert("postSharpen", preset.post_sharpen);
+    dict.insert("postDeband", preset.post_deband);
     (dict.end(),).to_variant()
 }
 
@@ -149,6 +152,9 @@ fn zbus_options<'a>(preset: &'a Preset, hide_cursor_seconds: u32) -> HashMap<&'s
             "hideCursorMs",
             Value::from(hide_cursor_seconds.saturating_mul(1000) as i32),
         ),
+        ("sharpness", Value::from(preset.sharpness.min(100) as i32)),
+        ("postSharpen", Value::from(preset.post_sharpen)),
+        ("postDeband", Value::from(preset.post_deband)),
     ])
 }
 

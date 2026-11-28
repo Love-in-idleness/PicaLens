@@ -31,6 +31,17 @@ const RCAS_PASS: &str = include_str!("shaders/rcas-pass.glsl");
 
 const SGSR_PASS: &str = include_str!("shaders/sgsr-pass.glsl");
 
+pub(crate) const CAS_PASS: &str = include_str!("shaders/cas.glsl");
+pub(crate) const SHARP_BILINEAR_PASS: &str = include_str!("shaders/sharp-bilinear.glsl");
+pub(crate) const XBRZ_PASS1: &str = include_str!("shaders/xbrz-pass1.glsl");
+pub(crate) const XBRZ_PASS2: &str = include_str!("shaders/xbrz-pass2.glsl");
+pub(crate) const CRT_PASS: &str = include_str!("shaders/crt.glsl");
+pub(crate) const DEBAND_PASS: &str = include_str!("shaders/deband.glsl");
+
+pub(crate) fn fragment_source(body: &str) -> String {
+    [FRAGMENT, body].concat()
+}
+
 pub(crate) fn filter_sources(filter: Filter) -> Vec<String> {
     match filter {
         Filter::Fsr => vec![
@@ -38,21 +49,26 @@ pub(crate) fn filter_sources(filter: Filter) -> Vec<String> {
             [FRAGMENT, "#define FSR_RCAS_F\n", FSR, RCAS_PASS].concat(),
         ],
         Filter::Sgsr => vec![[FRAGMENT, SGSR, SGSR_PASS].concat()],
+        Filter::Cas => vec![fragment_source(CAS_PASS)],
+        Filter::SharpBilinear => vec![fragment_source(SHARP_BILINEAR_PASS)],
+        Filter::Crt => vec![fragment_source(CRT_PASS)],
         _ => Vec::new(),
     }
 }
 
 pub struct GpuUpscaler {
     filter: Filter,
+    sharpness: f32,
     pipeline: Option<Pipeline>,
     latest: Option<Pixels>,
     rendered: Option<Size>,
 }
 
 impl GpuUpscaler {
-    pub fn new(filter: Filter) -> Self {
+    pub fn new(filter: Filter, sharpness: f32) -> Self {
         Self {
             filter,
+            sharpness: sharpness.clamp(0.0, 1.0),
             pipeline: None,
             latest: None,
             rendered: None,
@@ -78,7 +94,11 @@ impl GpuUpscaler {
         if self.pipeline.is_none() {
             self.pipeline = Some(Pipeline::new(display, self.filter)?);
         }
-        let output = self.pipeline.as_mut().unwrap().render(source, target)?;
+        let output = self
+            .pipeline
+            .as_mut()
+            .unwrap()
+            .render(source, target, self.sharpness)?;
         self.rendered = Some(target);
         Ok(Some((source.size, output)))
     }
@@ -192,7 +212,7 @@ impl Pipeline {
         Ok(pipeline)
     }
 
-    fn render(&mut self, source: &Pixels, target: Size) -> Result<gdk::Texture> {
+    fn render(&mut self, source: &Pixels, target: Size, sharpness: f32) -> Result<gdk::Texture> {
         let (w, h) = target;
         if [w, h, source.size.0, source.size.1]
             .into_iter()
@@ -242,10 +262,11 @@ impl Pipeline {
                     storage(gl, target, None);
                     self.intermediate_size = Some(target);
                 }
-                pass(gl, self.programs[0], input, intermediate, target)
-                    .and_then(|()| pass(gl, self.programs[1], intermediate, output.id, target))
+                pass(gl, self.programs[0], input, intermediate, target, sharpness).and_then(|()| {
+                    pass(gl, self.programs[1], intermediate, output.id, target, sharpness)
+                })
             } else {
-                pass(gl, self.programs[0], input, output.id, target)
+                pass(gl, self.programs[0], input, output.id, target, sharpness)
             };
             gl.framebuffer_texture_2d(
                 glow::FRAMEBUFFER,
@@ -391,6 +412,7 @@ unsafe fn pass(
     source: glow::NativeTexture,
     target: glow::NativeTexture,
     (w, h): Size,
+    sharpness: f32,
 ) -> Result<()> {
     unsafe {
         gl.framebuffer_texture_2d(
@@ -406,6 +428,9 @@ unsafe fn pass(
         gl.use_program(Some(program));
         let size = gl.get_uniform_location(program, "outputSize");
         gl.uniform_2_f32(size.as_ref(), w as f32, h as f32);
+        if let Some(sharp) = gl.get_uniform_location(program, "sharpness") {
+            gl.uniform_1_f32(Some(&sharp), sharpness);
+        }
         gl.bind_texture(glow::TEXTURE_2D, Some(source));
         gl.draw_arrays(glow::TRIANGLES, 0, 3);
         Ok(())
