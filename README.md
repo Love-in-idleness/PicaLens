@@ -31,7 +31,7 @@ Ubuntu 26.10 和 Debian 13（amd64）共用同一个安装包。安装时会自�
 从 [GitHub Releases](https://github.com/Love-in-idleness/PicaLens/releases) 下载 `.deb` 包后执行：
 
 ```sh
-sudo apt install ./picalens_0.2.1-1_amd64.deb
+sudo apt install ./picalens_0.3.0-1_amd64.deb
 ```
 
 > **提示**：Plasma 用户升级后请重新登录会话，以加载新版 KWin 后台；GNOME 用户首次安装后也需重新登录再启用扩展。
