@@ -34,6 +34,51 @@ impl Filter {
     }
 }
 
+/// Margins removed from the source window, in logical window pixels.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Crop {
+    pub left: u32,
+    pub top: u32,
+    pub right: u32,
+    pub bottom: u32,
+}
+
+impl Crop {
+    pub const MAX: u32 = 4096;
+    const KEYS: [&'static str; 4] = ["crop-left", "crop-top", "crop-right", "crop-bottom"];
+
+    pub fn is_empty(self) -> bool {
+        self == Self::default()
+    }
+
+    pub fn values(self) -> [u32; 4] {
+        [self.left, self.top, self.right, self.bottom]
+    }
+
+    pub fn from_values([left, top, right, bottom]: [u32; 4]) -> Self {
+        let clamp = |value: u32| value.min(Self::MAX);
+        Self {
+            left: clamp(left),
+            top: clamp(top),
+            right: clamp(right),
+            bottom: clamp(bottom),
+        }
+    }
+
+    /// Returns the visible rectangle `(x, y, width, height)` inside `size`,
+    /// after scaling the logical margins by `scale`.
+    pub fn visible(self, (width, height): (u32, u32), scale: f64) -> Option<(u32, u32, u32, u32)> {
+        let px = |value: u32| (f64::from(value) * scale).round() as u32;
+        let [left, top, right, bottom] = self.values().map(px);
+        let visible_w = width.checked_sub(left)?.checked_sub(right)?;
+        let visible_h = height.checked_sub(top)?.checked_sub(bottom)?;
+        (visible_w >= Self::MIN_VISIBLE && visible_h >= Self::MIN_VISIBLE)
+            .then_some((left, top, visible_w, visible_h))
+    }
+
+    pub const MIN_VISIBLE: u32 = 16;
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Preset {
     pub name: String,
@@ -41,12 +86,29 @@ pub struct Preset {
     pub filter: Filter,
     pub presentation: Presentation,
     pub render_device: String,
+    pub crop: Crop,
 }
 
 impl Preset {
     pub fn uses_render_worker(&self) -> bool {
         self.filter == Filter::Anime4k || (self.filter.uses_gpu() && !self.render_device.is_empty())
     }
+}
+
+/// Seconds without pointer motion before the cursor hides over a magnified
+/// window. Zero disables hiding.
+pub const HIDE_CURSOR_CHOICES: &[u32] = &[0, 1, 2, 3, 5];
+
+/// Normalizes compositor application identifiers so KWin desktop file names,
+/// GNOME application ids and X11 classes compare consistently.
+pub fn normalize_app_id(app: &str) -> Option<String> {
+    let app = app.trim();
+    let app = app.strip_suffix(".desktop").unwrap_or(app).to_lowercase();
+    let valid = !app.is_empty()
+        && app.len() <= 255
+        && !app.contains(['=', '[', ']', '\n', '\r'])
+        && !app.starts_with('#');
+    valid.then_some(app)
 }
 
 pub struct Settings {
@@ -131,6 +193,9 @@ impl Settings {
             filter: Filter::parse(&value(&self.file, &group, "filter")),
             presentation: Presentation::parse(&value(&self.file, &group, "presentation")),
             render_device: value(&self.file, &group, "render-device"),
+            crop: Crop::from_values(
+                Crop::KEYS.map(|key| self.file.integer(&group, key).unwrap_or(0).max(0) as u32),
+            ),
         }
     }
 
@@ -142,6 +207,81 @@ impl Settings {
             file.set_string(&group, "filter", preset.filter.id());
             file.set_string(&group, "presentation", preset.presentation.id());
             file.set_string(&group, "render-device", &preset.render_device);
+            for (key, value) in Crop::KEYS.into_iter().zip(preset.crop.values()) {
+                if value == 0 {
+                    let _ = file.remove_key(&group, key);
+                } else {
+                    file.set_integer(&group, key, value as i32);
+                }
+            }
+        })
+    }
+
+    /// Application rules, sorted by application id.
+    pub fn app_rules(&self) -> Vec<(String, String)> {
+        let mut rules: Vec<_> = self
+            .file
+            .keys("apps")
+            .map(|keys| {
+                keys.iter()
+                    .filter_map(|app| {
+                        let preset = self.file.string("apps", app).ok()?;
+                        Some((app.to_string(), preset.to_string()))
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        rules.sort();
+        rules
+    }
+
+    pub fn set_app_rule(&mut self, app: &str, preset: &str) -> Result<()> {
+        let app = normalize_app_id(app).ok_or("invalid_app_id")?;
+        self.edit(|file| file.set_string("apps", &app, preset))
+    }
+
+    pub fn remove_app_rule(&mut self, app: &str) -> Result<()> {
+        self.edit(|file| {
+            let _ = file.remove_key("apps", app);
+        })
+    }
+
+    /// The preset bound to `app`, if the rule and its preset still exist.
+    pub fn preset_for_app(&self, app: &str) -> Option<String> {
+        let app = normalize_app_id(app)?;
+        let preset = self.file.string("apps", &app).ok()?.to_string();
+        self.preset_ids().contains(&preset).then_some(preset)
+    }
+
+    pub fn hide_cursor_seconds(&self) -> u32 {
+        let seconds = self.file.integer("ui", "hide-cursor").unwrap_or(0).max(0) as u32;
+        if HIDE_CURSOR_CHOICES.contains(&seconds) { seconds } else { 0 }
+    }
+
+    pub fn set_hide_cursor_seconds(&mut self, seconds: u32) -> Result<()> {
+        self.edit(|file| file.set_integer("ui", "hide-cursor", seconds as i32))
+    }
+
+    pub fn inhibit_idle(&self) -> bool {
+        self.file.boolean("ui", "inhibit-idle").unwrap_or(false)
+    }
+
+    pub fn set_inhibit_idle(&mut self, inhibit: bool) -> Result<()> {
+        self.edit(|file| file.set_boolean("ui", "inhibit-idle", inhibit))
+    }
+
+    /// Folder for automatic screenshots. Empty asks for a file each time.
+    pub fn screenshot_dir(&self) -> String {
+        value(&self.file, "ui", "screenshot-dir")
+    }
+
+    pub fn set_screenshot_dir(&mut self, dir: &str) -> Result<()> {
+        self.edit(|file| {
+            if dir.is_empty() {
+                let _ = file.remove_key("ui", "screenshot-dir");
+            } else {
+                file.set_string("ui", "screenshot-dir", dir);
+            }
         })
     }
 
@@ -219,5 +359,53 @@ mod tests {
         settings.delete("preset", "mine").unwrap();
         assert_eq!(settings.selected(), DEFAULT_ID);
         std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn persists_crop_app_rules_and_magnification_options() {
+        let dir = std::env::temp_dir().join(glib::uuid_string_random().as_str());
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("settings.ini");
+        let mut settings = Settings::open(&path);
+        assert!(settings.preset(DEFAULT_ID).crop.is_empty());
+        assert_eq!(settings.hide_cursor_seconds(), 0);
+        assert!(!settings.inhibit_idle());
+        let preset = Preset {
+            name: "VN".into(),
+            crop: Crop::from_values([4, 30, 4, 9000]),
+            ..Preset::default()
+        };
+        settings.save_preset("vn", &preset).unwrap();
+        settings.set_app_rule("Muramasa_chs.exe", "vn").unwrap();
+        settings.set_app_rule("org.kde.Dolphin.desktop", "missing").unwrap();
+        settings.set_hide_cursor_seconds(3).unwrap();
+        settings.set_inhibit_idle(true).unwrap();
+        settings.set_screenshot_dir("/tmp/shots").unwrap();
+
+        let mut settings = Settings::open(&path);
+        let crop = settings.preset("vn").crop;
+        assert_eq!(crop.values(), [4, 30, 4, Crop::MAX]);
+        assert_eq!(settings.preset_for_app("muramasa_chs.exe").as_deref(), Some("vn"));
+        assert_eq!(settings.preset_for_app("MURAMASA_CHS.EXE.desktop").as_deref(), Some("vn"));
+        assert_eq!(settings.preset_for_app("org.kde.dolphin"), None);
+        assert_eq!(settings.app_rules().len(), 2);
+        assert_eq!(settings.hide_cursor_seconds(), 3);
+        assert!(settings.inhibit_idle());
+        assert_eq!(settings.screenshot_dir(), "/tmp/shots");
+        settings.remove_app_rule("muramasa_chs.exe").unwrap();
+        settings.set_screenshot_dir("").unwrap();
+        assert_eq!(settings.preset_for_app("muramasa_chs.exe"), None);
+        assert!(settings.screenshot_dir().is_empty());
+        assert!(settings.set_app_rule("bad[app]", "vn").is_err());
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn crop_keeps_a_visible_area() {
+        let crop = Crop::from_values([10, 20, 30, 40]);
+        assert_eq!(crop.visible((800, 600), 1.0), Some((10, 20, 760, 540)));
+        assert_eq!(crop.visible((800, 600), 1.5), Some((15, 30, 740, 510)));
+        assert_eq!(Crop::from_values([400, 0, 390, 0]).visible((800, 600), 1.0), None);
+        assert_eq!(Crop::default().visible((800, 600), 2.0), Some((0, 0, 800, 600)));
     }
 }

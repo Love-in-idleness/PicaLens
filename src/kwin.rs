@@ -1,6 +1,6 @@
-use std::time::Duration;
+use std::{collections::HashMap, path::Path, time::Duration};
 
-use ashpd::zbus::{self, Proxy, fdo::DBusProxy};
+use ashpd::zbus::{self, Proxy, fdo::DBusProxy, zvariant::Value};
 use futures_util::{FutureExt, StreamExt};
 use gtk::{gio, glib, prelude::*};
 
@@ -109,63 +109,135 @@ async fn active_call(
     .await
 }
 
+pub async fn active_app_id(conn: &gio::DBusConnection) -> Option<String> {
+    let reply = active_call(conn, "ActiveWindowAppId", None).await.ok()?;
+    let (app,) = reply.get::<(String,)>()?;
+    (!app.is_empty()).then_some(app)
+}
+
+pub async fn capture_screenshot(conn: &gio::DBusConnection, path: &Path) -> Result<bool> {
+    let path = path
+        .to_str()
+        .ok_or("screenshot path is not valid UTF-8")?;
+    let reply = active_call(conn, "CaptureScreenshot", Some(&(path,).to_variant())).await?;
+    Ok(reply.get::<(bool,)>().is_some_and(|(ok,)| ok))
+}
+
+fn gio_options(preset: &Preset, hide_cursor_seconds: u32) -> glib::Variant {
+    let dict = glib::VariantDict::new(None);
+    dict.insert("layout", preset.layout.id());
+    dict.insert("filter", preset.filter.id());
+    dict.insert("renderDevice", preset.render_device.as_str());
+    dict.insert("cropLeft", preset.crop.left as i32);
+    dict.insert("cropTop", preset.crop.top as i32);
+    dict.insert("cropRight", preset.crop.right as i32);
+    dict.insert("cropBottom", preset.crop.bottom as i32);
+    dict.insert("hideCursorMs", hide_cursor_seconds.saturating_mul(1000) as i32);
+    (dict.end(),).to_variant()
+}
+
+fn zbus_options<'a>(preset: &'a Preset, hide_cursor_seconds: u32) -> HashMap<&'static str, Value<'a>> {
+    HashMap::from([
+        ("layout", Value::from(preset.layout.id())),
+        ("filter", Value::from(preset.filter.id())),
+        ("renderDevice", Value::from(preset.render_device.as_str())),
+        ("cropLeft", Value::from(preset.crop.left as i32)),
+        ("cropTop", Value::from(preset.crop.top as i32)),
+        ("cropRight", Value::from(preset.crop.right as i32)),
+        ("cropBottom", Value::from(preset.crop.bottom as i32)),
+        (
+            "hideCursorMs",
+            Value::from(hide_cursor_seconds.saturating_mul(1000) as i32),
+        ),
+    ])
+}
+
 pub async fn magnify(
     backend: Proxy<'_>,
     mut stop: Stop,
     preset: &Preset,
+    hide_cursor_seconds: u32,
     active: Option<&gio::DBusConnection>,
 ) -> Result<String> {
     let Preset {
         layout,
         filter,
         render_device,
+        crop,
         ..
     } = preset;
     let mut finished = backend.receive_signal("Finished").await?;
     let mut owner = backend.receive_owner_changed().await?;
     let started: bool = if let Some(conn) = active {
-        let (method, args) = if preset.uses_render_worker() {
-            (
-                "StartActiveWithRenderDevice",
-                (layout.id(), filter.id(), render_device.as_str()).to_variant(),
-            )
-        } else if filter.uses_gpu() {
-            (
-                "StartActiveWithFilter",
-                (layout.id(), filter.id()).to_variant(),
-            )
-        } else {
-            ("StartActive", (layout.id(),).to_variant())
-        };
-        match active_call(conn, method, Some(&args)).await {
+        let options = gio_options(preset, hide_cursor_seconds);
+        match active_call(conn, "StartActiveWithOptions", Some(&options)).await {
             Ok(reply) => reply.get::<(bool,)>().ok_or("active_window_backend")?.0,
             Err(error) if error.matches(gio::DBusError::UnknownMethod) => {
-                return Err("active_window_backend".into());
+                if !crop.is_empty() {
+                    return Err("kwin_upgrade".into());
+                }
+                let (method, args) = if preset.uses_render_worker() {
+                    (
+                        "StartActiveWithRenderDevice",
+                        (layout.id(), filter.id(), render_device.as_str()).to_variant(),
+                    )
+                } else if filter.uses_gpu() {
+                    (
+                        "StartActiveWithFilter",
+                        (layout.id(), filter.id()).to_variant(),
+                    )
+                } else {
+                    ("StartActive", (layout.id(),).to_variant())
+                };
+                match active_call(conn, method, Some(&args)).await {
+                    Ok(reply) => reply.get::<(bool,)>().ok_or("active_window_backend")?.0,
+                    Err(error) if error.matches(gio::DBusError::UnknownMethod) => {
+                        return Err("active_window_backend".into());
+                    }
+                    Err(error) => return Err(error.into()),
+                }
             }
             Err(error) => return Err(error.into()),
         }
-    } else if preset.uses_render_worker() {
-        backend
-            .call(
-                "StartWithRenderDevice",
-                &(layout.id(), filter.id(), render_device.as_str()),
-            )
-            .await?
-    } else if filter.uses_gpu() {
-        backend
-            .call("StartWithFilter", &(layout.id(), filter.id()))
-            .await?
     } else {
-        match layout {
-            Layout::Fit => backend.call("Start", &()).await?,
-            _ => match backend.call("StartWithLayout", &(layout.id(),)).await {
-                Err(zbus::Error::MethodError(name, ..))
-                    if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
-                {
+        let options = zbus_options(preset, hide_cursor_seconds);
+        match backend
+            .call::<_, _, bool>("StartWithOptions", &(options,))
+            .await
+        {
+            Ok(started) => started,
+            Err(zbus::Error::MethodError(name, ..))
+                if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+            {
+                if !crop.is_empty() {
                     return Err("kwin_upgrade".into());
                 }
-                result => result?,
-            },
+                if preset.uses_render_worker() {
+                    backend
+                        .call(
+                            "StartWithRenderDevice",
+                            &(layout.id(), filter.id(), render_device.as_str()),
+                        )
+                        .await?
+                } else if filter.uses_gpu() {
+                    backend
+                        .call("StartWithFilter", &(layout.id(), filter.id()))
+                        .await?
+                } else {
+                    match layout {
+                        Layout::Fit => backend.call("Start", &()).await?,
+                        _ => match backend.call("StartWithLayout", &(layout.id(),)).await {
+                            Err(zbus::Error::MethodError(name, ..))
+                                if name.as_str() == "org.freedesktop.DBus.Error.UnknownMethod" =>
+                            {
+                                return Err("kwin_upgrade".into());
+                            }
+                            result => result?,
+                        },
+                    }
+                }
+            }
+            Err(error) => return Err(error.into()),
         }
     };
     if !started {
@@ -194,7 +266,7 @@ pub async fn magnify(
             let signal = signal.ok_or("PicaLens lost the KWin backend")?;
             let (reason, _): (String, bool) = signal.body().deserialize()?;
             if matches!(reason.as_str(), "interactive_filter_unavailable" | "render_gpu_missing"
-                | "render_gpu_driver" | "render_size" | "render_worker_failed") {
+                | "render_gpu_driver" | "render_size" | "render_worker_failed" | "invalid_crop") {
                 return Err(reason.into());
             }
             Ok(reason)

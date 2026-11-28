@@ -29,6 +29,33 @@ impl From<Frame> for Pixels {
     }
 }
 
+impl Pixels {
+    /// Copies the RGBA rectangle `(x, y, width, height)`.
+    pub fn crop(&self, (x, y, width, height): (u32, u32, u32, u32)) -> Option<Self> {
+        if (x, y, width, height) == (0, 0, self.size.0, self.size.1) {
+            return Some(self.clone());
+        }
+        if width == 0
+            || height == 0
+            || x.checked_add(width)? > self.size.0
+            || y.checked_add(height)? > self.size.1
+        {
+            return None;
+        }
+        let stride = self.size.0 as usize * 4;
+        let row = width as usize * 4;
+        let mut bytes = Vec::with_capacity(row * height as usize);
+        for line in y as usize..(y + height) as usize {
+            let start = line * stride + x as usize * 4;
+            bytes.extend_from_slice(self.bytes.get(start..start + row)?);
+        }
+        Some(Self {
+            size: (width, height),
+            bytes: glib::Bytes::from_owned(bytes),
+        })
+    }
+}
+
 pub struct ScaledFrame {
     pub source: Size,
     pub image: Pixels,
@@ -211,6 +238,21 @@ fn scale2x(input: &[u8], width: usize, height: usize) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn crops_rgba_rows() {
+        let bytes: Vec<u8> = (0..4 * 3 * 4).map(|value| value as u8).collect();
+        let pixels = Pixels {
+            size: (4, 3),
+            bytes: glib::Bytes::from_owned(bytes),
+        };
+        let cropped = pixels.crop((1, 1, 2, 2)).unwrap();
+        assert_eq!(cropped.size, (2, 2));
+        assert_eq!(&cropped.bytes[..8], &[20, 21, 22, 23, 24, 25, 26, 27]);
+        assert_eq!(&cropped.bytes[8..], &[36, 37, 38, 39, 40, 41, 42, 43]);
+        assert!(pixels.crop((3, 0, 2, 1)).is_none());
+        assert_eq!(pixels.crop((0, 0, 4, 3)).unwrap().size, (4, 3));
+    }
 
     #[test]
     fn scale2x_reconstructs_a_diagonal_corner() {

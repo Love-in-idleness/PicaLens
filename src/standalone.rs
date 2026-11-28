@@ -1,5 +1,6 @@
 use std::{
     cell::{Cell, RefCell},
+    path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, Instant},
 };
@@ -20,19 +21,29 @@ use crate::{
     preview::{self, StopSender},
     render_client::{self, RenderUpscaler},
     session::{self, Result, Stop, Target},
-    settings::{DEFAULT_ID, Filter, Language, Layout, Presentation, Preset, Settings, Theme},
+    settings::{
+        Crop, DEFAULT_ID, Filter, HIDE_CURSOR_CHOICES, Language, Layout, Presentation, Preset,
+        Settings, Theme, normalize_app_id,
+    },
     shortcut::{self, DesktopShortcut},
     upscale::{Pixels, Upscaler},
     viewport::Viewport,
 };
 
 const APP_ID: &str = "io.github.LoveInIdleness.PicaLens";
+const HIDE_CURSOR_LABELS: &[&str] = &[
+    "hide_cursor_off",
+    "hide_cursor_1s",
+    "hide_cursor_2s",
+    "hide_cursor_3s",
+    "hide_cursor_5s",
+];
 
 pub fn run() -> std::process::ExitCode {
     let args: Vec<_> = std::env::args_os().collect();
     match args.get(1).and_then(|arg| arg.to_str()) {
         None if args.len() == 1 => {}
-        Some("toggle") if args.len() == 2 => {}
+        Some("toggle" | "screenshot") if args.len() == 2 => {}
         flag => {
             let locale = Locale::new(Settings::load().language());
             let help = locale.text("cli_help");
@@ -62,10 +73,13 @@ pub fn run() -> std::process::ExitCode {
             .borrow_mut()
             .get_or_insert_with(|| View::new(app))
             .clone();
-        if command.arguments().len() == 1 {
+        let arguments = command.arguments();
+        if arguments.len() == 1 {
             if !view.stop("PicaLens opened") {
                 view.window.present();
             }
+        } else if arguments.get(1).and_then(|arg| arg.to_str()) == Some("screenshot") {
+            view.trigger_screenshot();
         } else if !view.stop("toggle") {
             let target = if session::portal_desktop() {
                 Target::Choose
@@ -95,9 +109,13 @@ struct View {
     locale: Locale,
     chooser: adw::ComboRow,
     presets: gtk::ListBox,
+    app_rules: gtk::ListBox,
     filling_presets: Cell<bool>,
     active: RefCell<Option<StopSender>>,
     capture_window: RefCell<Option<adw::ApplicationWindow>>,
+    preview_screenshot: RefCell<Option<Rc<dyn Fn()>>>,
+    kwin_active: Cell<bool>,
+    last_app_id: RefCell<Option<String>>,
     closing: Cell<bool>,
     _games: Rc<GamePage>,
 }
@@ -210,6 +228,22 @@ impl View {
         preset_group.add(&presets);
         preset_page.add(&preset_group);
 
+        let app_rules_group = adw::PreferencesGroup::builder()
+            .title(t("app_rules"))
+            .description(t("app_rules_hint"))
+            .build();
+        let add_rule = gtk::Button::builder()
+            .icon_name("list-add-symbolic")
+            .tooltip_text(t("add_app_rule"))
+            .build();
+        app_rules_group.set_header_suffix(Some(&add_rule));
+        let app_rules = gtk::ListBox::builder()
+            .selection_mode(gtk::SelectionMode::None)
+            .build();
+        app_rules.add_css_class("boxed-list");
+        app_rules_group.add(&app_rules);
+        preset_page.add(&app_rules_group);
+
         let games = GamePage::new(&window, settings.clone(), locale);
         let options = adw::PreferencesPage::new();
         let ui = adw::PreferencesGroup::builder()
@@ -234,6 +268,45 @@ impl View {
         language.set_subtitle(&t("language_restart"));
         ui.add(&language);
         options.add(&ui);
+
+        let behavior = adw::PreferencesGroup::builder()
+            .title(t("magnification_behavior"))
+            .build();
+        let current_hide_cursor = settings.borrow().hide_cursor_seconds();
+        let hide_cursor = combo(
+            locale,
+            "hide_cursor",
+            HIDE_CURSOR_LABELS.iter().copied(),
+            index(HIDE_CURSOR_CHOICES, current_hide_cursor),
+        );
+        behavior.add(&hide_cursor);
+        let inhibit_idle = adw::SwitchRow::builder()
+            .title(t("inhibit_idle"))
+            .subtitle(t("inhibit_idle_hint"))
+            .active(settings.borrow().inhibit_idle())
+            .build();
+        behavior.add(&inhibit_idle);
+        let current_shot_dir = settings.borrow().screenshot_dir();
+        let screenshot_dir = adw::ActionRow::builder()
+            .title(t("screenshot_dir"))
+            .subtitle(if current_shot_dir.is_empty() {
+                t("screenshot_ask")
+            } else {
+                current_shot_dir.clone()
+            })
+            .build();
+        let choose_shot_dir = gtk::Button::with_label(&t("choose_folder"));
+        choose_shot_dir.set_valign(gtk::Align::Center);
+        let clear_shot_dir = gtk::Button::builder()
+            .icon_name("edit-clear-symbolic")
+            .tooltip_text(t("clear"))
+            .valign(gtk::Align::Center)
+            .visible(!current_shot_dir.is_empty())
+            .build();
+        screenshot_dir.add_suffix(&choose_shot_dir);
+        screenshot_dir.add_suffix(&clear_shot_dir);
+        behavior.add(&screenshot_dir);
+        options.add(&behavior);
         let shortcuts = adw::PreferencesGroup::builder()
             .title(t("shortcuts"))
             .build();
@@ -287,15 +360,20 @@ impl View {
             locale,
             chooser,
             presets,
+            app_rules,
             filling_presets: Cell::new(false),
             active: RefCell::new(None),
             capture_window: RefCell::new(None),
+            preview_screenshot: RefCell::new(None),
+            kwin_active: Cell::new(false),
+            last_app_id: RefCell::new(None),
             closing: Cell::new(false),
             _games: games,
         });
         view.reload_presets();
         for (button, handler) in [
             (add, Self::new_preset as fn(&Rc<Self>)),
+            (add_rule, Self::new_app_rule as fn(&Rc<Self>)),
             (view.launch.clone(), Self::launch),
         ] {
             button.connect_clicked({
@@ -365,6 +443,96 @@ impl View {
                 }
             }
         });
+        hide_cursor.connect_selected_notify({
+            let weak = Rc::downgrade(&view);
+            move |row| {
+                let (Some(view), Some(&seconds)) = (
+                    weak.upgrade(),
+                    HIDE_CURSOR_CHOICES.get(row.selected() as usize),
+                ) else {
+                    return;
+                };
+                let saved = view.settings.borrow().hide_cursor_seconds();
+                if seconds == saved {
+                    return;
+                }
+                let result = view.settings.borrow_mut().set_hide_cursor_seconds(seconds);
+                if let Err(error) = result {
+                    row.set_selected(index(HIDE_CURSOR_CHOICES, saved) as u32);
+                    view.save_failed(error);
+                }
+            }
+        });
+        inhibit_idle.connect_active_notify({
+            let weak = Rc::downgrade(&view);
+            move |row| {
+                let Some(view) = weak.upgrade() else { return };
+                let active = row.is_active();
+                if active == view.settings.borrow().inhibit_idle() {
+                    return;
+                }
+                let result = view.settings.borrow_mut().set_inhibit_idle(active);
+                if let Err(error) = result {
+                    row.set_active(!active);
+                    view.save_failed(error);
+                }
+            }
+        });
+        choose_shot_dir.connect_clicked({
+            let weak = Rc::downgrade(&view);
+            let row = screenshot_dir.downgrade();
+            let clear = clear_shot_dir.downgrade();
+            move |_| {
+                let Some(view) = weak.upgrade() else { return };
+                let picker = gtk::FileDialog::builder()
+                    .title(view.t("screenshot_dir"))
+                    .modal(true)
+                    .build();
+                let current = view.settings.borrow().screenshot_dir();
+                if !current.is_empty() {
+                    picker.set_initial_folder(Some(&gio::File::for_path(current)));
+                }
+                let window = view.window.clone();
+                let row = row.clone();
+                let clear = clear.clone();
+                glib::spawn_future_local(async move {
+                    let Ok(folder) = picker.select_folder_future(Some(&window)).await else {
+                        return;
+                    };
+                    let Some(path) = folder.path() else { return };
+                    let Some(text) = path.to_str() else { return };
+                    let result = view.settings.borrow_mut().set_screenshot_dir(text);
+                    match result {
+                        Ok(()) => {
+                            if let Some(row) = row.upgrade() {
+                                row.set_subtitle(text);
+                            }
+                            if let Some(clear) = clear.upgrade() {
+                                clear.set_visible(true);
+                            }
+                        }
+                        Err(error) => view.save_failed(error),
+                    }
+                });
+            }
+        });
+        clear_shot_dir.connect_clicked({
+            let weak = Rc::downgrade(&view);
+            let row = screenshot_dir.downgrade();
+            move |button| {
+                let Some(view) = weak.upgrade() else { return };
+                let result = view.settings.borrow_mut().set_screenshot_dir("");
+                match result {
+                    Ok(()) => {
+                        if let Some(row) = row.upgrade() {
+                            row.set_subtitle(&view.t("screenshot_ask"));
+                        }
+                        button.set_visible(false);
+                    }
+                    Err(error) => view.save_failed(error),
+                }
+            }
+        });
         view.window.connect_close_request({
             let weak = Rc::downgrade(&view);
             move |window| {
@@ -415,13 +583,17 @@ impl View {
         for id in &ids {
             let preset = settings.preset(id);
             let name = self.preset_name(&preset);
-            let subtitle = [
+            let mut subtitle = [
                 preset.layout.id(),
                 preset.filter.id(),
                 preset.presentation.id(),
             ]
             .map(|key| self.t(key))
             .join(" · ");
+            if !preset.crop.is_empty() {
+                let [l, t, r, b] = preset.crop.values();
+                subtitle.push_str(&format!(" · {} {l}/{t}/{r}/{b}", self.t("cropped")));
+            }
             let row = adw::ActionRow::builder()
                 .title(glib::markup_escape_text(&name))
                 .subtitle(subtitle)
@@ -478,7 +650,153 @@ impl View {
         self.chooser.set_selected(selected as u32);
         self.filling_presets.set(false);
         drop(settings);
+        self.reload_app_rules();
         self.show_mode();
+    }
+
+    fn reload_app_rules(self: &Rc<Self>) {
+        while let Some(row) = self.app_rules.first_child() {
+            self.app_rules.remove(&row);
+        }
+        let settings = self.settings.borrow();
+        let rules = settings.app_rules();
+        if rules.is_empty() {
+            let empty = adw::ActionRow::builder()
+                .title(self.t("no_app_rules"))
+                .build();
+            empty.add_css_class("dim-label");
+            self.app_rules.append(&empty);
+            return;
+        }
+        let ids = settings.preset_ids();
+        for (app, preset_id) in rules {
+            let preset = if ids.contains(&preset_id) {
+                settings.preset(&preset_id)
+            } else {
+                settings.preset(DEFAULT_ID)
+            };
+            let row = adw::ActionRow::builder()
+                .title(glib::markup_escape_text(&app))
+                .subtitle(glib::markup_escape_text(&self.preset_name(&preset)))
+                .build();
+            let edit = self.preset_button("document-edit-symbolic", "edit");
+            let remove = self.preset_button("user-trash-symbolic", "delete");
+            row.add_suffix(&edit);
+            row.add_suffix(&remove);
+            edit.connect_clicked({
+                let weak = Rc::downgrade(self);
+                let app = app.clone();
+                let preset_id = preset_id.clone();
+                move |_| {
+                    if let Some(view) = weak.upgrade() {
+                        view.edit_app_rule(Some(app.clone()), preset_id.clone());
+                    }
+                }
+            });
+            remove.connect_clicked({
+                let weak = Rc::downgrade(self);
+                move |_| {
+                    if let Some(view) = weak.upgrade() {
+                        let result = view.settings.borrow_mut().remove_app_rule(&app);
+                        match result {
+                            Ok(()) => view.reload_app_rules(),
+                            Err(error) => view.save_failed(error),
+                        }
+                    }
+                }
+            });
+            self.app_rules.append(&row);
+        }
+    }
+
+    fn new_app_rule(self: &Rc<Self>) {
+        let initial_preset = self.settings.borrow().selected();
+        self.edit_app_rule(None, initial_preset);
+    }
+
+    #[allow(deprecated)]
+    fn edit_app_rule(self: &Rc<Self>, original: Option<String>, preset_id: String) {
+        let dialog = adw::MessageDialog::new(
+            Some(&self.window),
+            Some(&self.t("edit_app_rule")),
+            None,
+        );
+        let group = adw::PreferencesGroup::new();
+        let initial_app = original
+            .clone()
+            .or_else(|| self.last_app_id.borrow().clone())
+            .unwrap_or_default();
+        let app_entry = adw::EntryRow::builder()
+            .title(self.t("app_id"))
+            .text(initial_app)
+            .build();
+        let settings = self.settings.borrow();
+        let ids = settings.preset_ids();
+        let names = ids
+            .iter()
+            .map(|id| self.preset_name(&settings.preset(id)))
+            .collect::<Vec<_>>();
+        drop(settings);
+        let selected = ids.iter().position(|id| *id == preset_id).unwrap_or(0);
+        let preset_row = adw::ComboRow::builder()
+            .title(self.t("current_preset"))
+            .model(&gtk::StringList::new(
+                &names.iter().map(String::as_str).collect::<Vec<_>>(),
+            ))
+            .selected(selected as u32)
+            .build();
+        let hint = gtk::Label::builder()
+            .label(self.t("app_id_hint"))
+            .wrap(true)
+            .xalign(0.0)
+            .build();
+        hint.add_css_class("dim-label");
+        group.add(&app_entry);
+        group.add(&preset_row);
+        group.add(&hint);
+        dialog.set_extra_child(Some(&group));
+        dialog.add_response("cancel", &self.t("cancel"));
+        dialog.add_response("save", &self.t("save"));
+        dialog.set_response_appearance("save", adw::ResponseAppearance::Suggested);
+        dialog.set_default_response(Some("save"));
+        dialog.set_close_response("cancel");
+        dialog.set_response_enabled("save", normalize_app_id(&app_entry.text()).is_some());
+        app_entry.connect_changed({
+            let dialog = dialog.downgrade();
+            move |entry| {
+                if let Some(dialog) = dialog.upgrade() {
+                    dialog.set_response_enabled("save", normalize_app_id(&entry.text()).is_some());
+                }
+            }
+        });
+        dialog.connect_response(Some("save"), {
+            let weak = Rc::downgrade(self);
+            move |_, _| {
+                let Some(view) = weak.upgrade() else { return };
+                let Some(normalized) = normalize_app_id(&app_entry.text()) else {
+                    view.toast("invalid_app_id");
+                    return;
+                };
+                let chosen = ids
+                    .get(preset_row.selected() as usize)
+                    .cloned()
+                    .unwrap_or_else(|| DEFAULT_ID.into());
+                let result = (|| -> Result<()> {
+                    let mut settings = view.settings.borrow_mut();
+                    if let Some(old) = original.as_deref()
+                        && old != normalized
+                    {
+                        settings.remove_app_rule(old)?;
+                    }
+                    settings.set_app_rule(&normalized, &chosen)
+                })();
+                match result {
+                    Ok(()) => view.reload_app_rules(),
+                    Err(error) => view.save_failed(error),
+                }
+            }
+        });
+        dialog.present();
     }
 
     fn preset_button(&self, icon: &str, title: &str) -> gtk::Button {
@@ -588,6 +906,23 @@ impl View {
             group.add(row);
         }
         group.add(&device);
+        let crop_expander = adw::ExpanderRow::builder()
+            .title(self.t("crop"))
+            .subtitle(self.t("crop_hint"))
+            .expanded(!preset.crop.is_empty())
+            .build();
+        let crop_spin = |key: &str, initial: u32| {
+            let row = adw::SpinRow::with_range(0.0, f64::from(Crop::MAX), 1.0);
+            row.set_title(&self.t(key));
+            row.set_value(f64::from(initial));
+            crop_expander.add_row(&row);
+            row
+        };
+        let crop_left = crop_spin("crop_left", preset.crop.left);
+        let crop_top = crop_spin("crop_top", preset.crop.top);
+        let crop_right = crop_spin("crop_right", preset.crop.right);
+        let crop_bottom = crop_spin("crop_bottom", preset.crop.bottom);
+        group.add(&crop_expander);
         let hint = gtk::Label::builder()
             .label(self.t("preview_only_options"))
             .wrap(true)
@@ -632,6 +967,12 @@ impl View {
                         .get(device.selected() as usize)
                         .cloned()
                         .unwrap_or_default(),
+                    crop: Crop::from_values([
+                        crop_left.value() as u32,
+                        crop_top.value() as u32,
+                        crop_right.value() as u32,
+                        crop_bottom.value() as u32,
+                    ]),
                 };
                 let result = view.settings.borrow_mut().save_preset(&id, &preset);
                 match result {
@@ -697,7 +1038,8 @@ impl View {
     }
 
     fn start(self: &Rc<Self>, app: &impl IsA<gio::Application>, target: Target) {
-        let preset = self.active_preset();
+        let fallback_preset = self.active_preset();
+        let inhibit = self.settings.borrow().inhibit_idle();
         let (sender, receiver) = oneshot::channel();
         self.active
             .replace(Some(Rc::new(RefCell::new(Some(sender)))));
@@ -708,6 +1050,7 @@ impl View {
         }));
         self.launch.set_label(&self.t("cancel"));
         let hold = app.hold();
+        let idle = inhibit.then(|| IdleInhibitor::acquire(&self.window));
         let view = self.clone();
         let signals = [libc::SIGINT, libc::SIGTERM].map(|signal| {
             let weak = Rc::downgrade(self);
@@ -721,6 +1064,12 @@ impl View {
         });
         glib::spawn_future_local(async move {
             let _hold = hold;
+            let _idle = idle;
+            let preset = if target == Target::Active {
+                view.resolve_active_preset().await.unwrap_or(fallback_preset)
+            } else {
+                fallback_preset
+            };
             let result = view.magnify(receiver, &preset, target).await;
             for signal in signals {
                 signal.remove();
@@ -728,6 +1077,64 @@ impl View {
             view.active.borrow_mut().take();
             view.reset(result, target);
         });
+    }
+
+    async fn resolve_active_preset(&self) -> Option<Preset> {
+        let conn = self.window.application()?.dbus_connection()?;
+        let app_id = if is_plasma() {
+            let _ = kwin::discover().await;
+            kwin::active_app_id(&conn).await
+        } else if is_gnome() {
+            gnome::active_app_id(&conn).await
+        } else {
+            None
+        }?;
+        let normalized = normalize_app_id(&app_id)?;
+        self.last_app_id.replace(Some(normalized.clone()));
+        let settings = self.settings.borrow();
+        let preset_id = settings.preset_for_app(&normalized)?;
+        diagnostic!("picalens matched app={normalized} preset={preset_id}");
+        Some(settings.preset(&preset_id))
+    }
+
+    fn trigger_screenshot(&self) {
+        if let Some(capture) = self.preview_screenshot.borrow().clone() {
+            capture();
+            return;
+        }
+        if !self.kwin_active.get() {
+            return;
+        }
+        let Some(conn) = self
+            .window
+            .application()
+            .and_then(|app| app.dbus_connection())
+        else {
+            return;
+        };
+        let dir = self.auto_screenshot_dir();
+        glib::spawn_future_local(async move {
+            if let Err(error) = std::fs::create_dir_all(&dir) {
+                diagnostic!("picalens could not create screenshot directory: {error}");
+                return;
+            }
+            let path = next_screenshot_path(&dir);
+            match kwin::capture_screenshot(&conn, &path).await {
+                Ok(true) => diagnostic!("picalens requested screenshot path={}", path.display()),
+                Ok(false) => diagnostic!("picalens screenshot unavailable"),
+                Err(error) => diagnostic!("picalens screenshot failed: {error}"),
+            }
+        });
+    }
+
+    fn auto_screenshot_dir(&self) -> PathBuf {
+        let configured = self.settings.borrow().screenshot_dir();
+        if !configured.is_empty() {
+            return PathBuf::from(configured);
+        }
+        glib::user_special_dir(glib::UserDirectory::Pictures)
+            .unwrap_or_else(glib::home_dir)
+            .join("PicaLens")
     }
 
     fn stop(&self, reason: &'static str) -> bool {
@@ -763,6 +1170,9 @@ impl View {
             && preset.layout == Layout::Fit
             && let Some(desktop) = desktop
         {
+            if !preset.crop.is_empty() {
+                return Err("interactive_crop_unavailable".into());
+            }
             let backend = futures_util::select_biased! {
                 reason = stop => return Ok(reason.unwrap_or("application shutdown").into()),
                 backend = native::discover(desktop, preset.filter).fuse() => backend,
@@ -776,6 +1186,7 @@ impl View {
         if !preview_only && matches!(desktop, Some(native::Desktop::Treeland)) {
             return Err("treeland_interactive_unavailable".into());
         }
+        let hide_cursor_seconds = self.settings.borrow().hide_cursor_seconds();
         let needs_portal = preview_only || session::portal_desktop();
         if needs_portal && target == Target::Active && !interactive_gpu {
             return Err("active_window_preset".into());
@@ -806,7 +1217,10 @@ impl View {
                     self.window.set_visible(false);
                     None
                 };
-                return kwin::magnify(backend, stop, preset, active).await;
+                self.kwin_active.set(true);
+                let result = kwin::magnify(backend, stop, preset, hide_cursor_seconds, active).await;
+                self.kwin_active.set(false);
+                return result;
             }
         }
         if render_worker && interactive_gpu {
@@ -828,7 +1242,15 @@ impl View {
                 if target == Target::Choose {
                     self.window.set_visible(false);
                 }
-                return gnome::magnify(conn, stop, preset.layout, self.locale, target).await;
+                return gnome::magnify(
+                    conn,
+                    stop,
+                    preset,
+                    hide_cursor_seconds,
+                    self.locale,
+                    target,
+                )
+                .await;
             }
         }
         if target == Target::Active {
@@ -840,15 +1262,19 @@ impl View {
         self.backend.set_subtitle(&self.t("backend_portal"));
         self.window.set_visible(false);
         diagnostic!("picalens backend=portal mode=view-only");
-        session::capture_window(None, stop, |capture, _| self.show_capture(capture, preset))
-            .await
-            .map(str::to_owned)
+        session::capture_window(None, stop, |capture, size| {
+            self.show_capture(capture, preset, size, hide_cursor_seconds)
+        })
+        .await
+        .map(str::to_owned)
     }
 
     async fn show_capture(
         self: &Rc<Self>,
         capture: Capture,
         preset: &Preset,
+        logical_size: Option<(i32, i32)>,
+        hide_cursor_seconds: u32,
     ) -> Result<&'static str> {
         let started = Instant::now();
         let viewport = Viewport::new(preset.layout, preset.filter);
@@ -880,7 +1306,15 @@ impl View {
                 return Err(error.into());
             }
             if let Some(frame) = capture.take_frame() {
-                let pixels = Pixels::from(frame);
+                let mut pixels = Pixels::from(frame);
+                if !preset.crop.is_empty() {
+                    let scale = frame_crop_scale(pixels.size, logical_size);
+                    let rect = preset
+                        .crop
+                        .visible(pixels.size, scale)
+                        .ok_or("invalid_crop")?;
+                    pixels = pixels.crop(rect).ok_or("invalid_crop")?;
+                }
                 viewport.set_frame(preview::rgba_texture(pixels.size, &pixels.bytes)?.upcast());
                 if let Some(upscaler) = &mut upscaler {
                     upscaler.set_source(pixels);
@@ -890,11 +1324,11 @@ impl View {
                     gpu.set_source(pixels);
                 }
                 if toasts.is_none() {
-                    toasts =
-                        Some(self.open_preview(
-                            &viewport,
-                            preset.presentation != Presentation::Windowed,
-                        )?);
+                    toasts = Some(self.open_preview(
+                        &viewport,
+                        preset.presentation != Presentation::Windowed,
+                        hide_cursor_seconds,
+                    )?);
                     diagnostic!("picalens portal first frame drawn");
                 }
             }
@@ -933,6 +1367,7 @@ impl View {
         self: &Rc<Self>,
         viewport: &Viewport,
         fullscreen: bool,
+        hide_cursor_seconds: u32,
     ) -> Result<adw::ToastOverlay> {
         let app = self.window.application().ok_or("application shutdown")?;
         let window = adw::ApplicationWindow::builder()
@@ -958,17 +1393,64 @@ impl View {
         toasts.set_child(Some(&view));
         window.set_content(Some(&toasts));
         toasts.add_toast(adw::Toast::new(&self.t("preview_hint")));
+
+        let idle_timer: Rc<RefCell<Option<glib::SourceId>>> = Rc::new(RefCell::new(None));
+        let arm_hide_cursor: Rc<dyn Fn()> = Rc::new({
+            let view = view.downgrade();
+            let tools = tools.downgrade();
+            let idle_timer = idle_timer.clone();
+            move || {
+                if let Some(id) = idle_timer.borrow_mut().take() {
+                    id.remove();
+                }
+                if let Some(view) = view.upgrade() {
+                    view.set_cursor(None);
+                }
+                if hide_cursor_seconds == 0 {
+                    return;
+                }
+                let view = view.clone();
+                let tools = tools.clone();
+                let timer_slot = idle_timer.clone();
+                let id = glib::timeout_add_local_once(
+                    Duration::from_secs(u64::from(hide_cursor_seconds)),
+                    move || {
+                        timer_slot.borrow_mut().take();
+                        if let Some(view) = view.upgrade() {
+                            let hidden = gdk::Cursor::from_name("none", None);
+                            view.set_cursor(hidden.as_ref());
+                        }
+                        if let Some(tools) = tools.upgrade() {
+                            set_tools_visible(&tools, false);
+                        }
+                    },
+                );
+                idle_timer.borrow_mut().replace(id);
+            }
+        });
+        arm_hide_cursor();
+
         let motion = gtk::EventControllerMotion::new();
         motion.set_propagation_phase(gtk::PropagationPhase::Capture);
         motion.connect_motion({
             let tools = tools.downgrade();
+            let arm = arm_hide_cursor.clone();
             move |_, _, y| {
+                arm();
                 if let Some(tools) = tools.upgrade() {
                     set_tools_visible(&tools, y <= 58.0);
                 }
             }
         });
         view.add_controller(motion);
+        window.connect_destroy({
+            let idle_timer = idle_timer.clone();
+            move |_| {
+                if let Some(id) = idle_timer.borrow_mut().take() {
+                    id.remove();
+                }
+            }
+        });
         let switch = {
             let window = window.downgrade();
             move || {
@@ -985,7 +1467,7 @@ impl View {
             let switch = switch.clone();
             move |_| switch()
         });
-        let save = {
+        let save: Rc<dyn Fn()> = Rc::new({
             let weak = Rc::downgrade(self);
             let viewport = viewport.downgrade();
             let window = window.downgrade();
@@ -1000,7 +1482,8 @@ impl View {
                     owner.capture_screenshot(&viewport, &window, &toasts);
                 }
             }
-        };
+        });
+        self.preview_screenshot.replace(Some(save.clone()));
         screenshot.connect_clicked({
             let save = save.clone();
             move |_| save()
@@ -1055,11 +1538,24 @@ impl View {
         let Some(image) = viewport.screenshot() else {
             return;
         };
+        let configured_dir = self.settings.borrow().screenshot_dir();
+        if !configured_dir.is_empty() {
+            let dir = PathBuf::from(configured_dir);
+            let key = if std::fs::create_dir_all(&dir).is_ok()
+                && image.save_to_png(next_screenshot_path(&dir)).is_ok()
+            {
+                "screenshot_saved"
+            } else {
+                "screenshot_failed"
+            };
+            toasts.add_toast(adw::Toast::new(&self.t(key)));
+            return;
+        }
         let picker = gtk::FileDialog::builder()
             .title(self.t("screenshot"))
             .modal(true)
             .build();
-        picker.set_initial_name(Some("PicaLens.png"));
+        picker.set_initial_name(Some(&default_screenshot_name()));
         let window = window.clone();
         let toasts = toasts.clone();
         let locale = self.locale;
@@ -1081,6 +1577,8 @@ impl View {
     }
 
     fn reset(&self, result: Result<String>, target: Target) {
+        self.preview_screenshot.borrow_mut().take();
+        self.kwin_active.set(false);
         let preview = self.capture_window.take();
         let showed_preview = preview.is_some();
         if let Some(window) = preview {
@@ -1127,7 +1625,10 @@ impl View {
                     | "render_worker_failed"
                     | "no_active_window"
                     | "active_window_preset"
-                    | "active_window_backend" => error.as_str(),
+                    | "active_window_backend"
+                    | "gnome_upgrade"
+                    | "invalid_crop"
+                    | "interactive_crop_unavailable" => error.as_str(),
                     _ => "magnify_failed",
                 };
                 self.status.set_title(&self.t(key));
@@ -1304,4 +1805,85 @@ fn edit_shortcut(
     });
     dialog.add_controller(keys);
     dialog.present();
+}
+
+struct IdleInhibitor {
+    app: gtk::Application,
+    cookie: u32,
+}
+
+impl IdleInhibitor {
+    fn acquire(window: &adw::ApplicationWindow) -> Option<Self> {
+        let app = window.application()?;
+        let cookie = app.inhibit(
+            Some(window),
+            gtk::ApplicationInhibitFlags::IDLE,
+            Some("PicaLens window magnification"),
+        );
+        (cookie != 0).then_some(Self { app, cookie })
+    }
+}
+
+impl Drop for IdleInhibitor {
+    fn drop(&mut self) {
+        self.app.uninhibit(self.cookie);
+    }
+}
+
+fn frame_crop_scale((width, height): (u32, u32), logical: Option<(i32, i32)>) -> f64 {
+    let Some((lw, lh)) = logical.filter(|&(w, h)| w > 0 && h > 0) else {
+        return 1.0;
+    };
+    let sx = f64::from(width) / f64::from(lw);
+    let sy = f64::from(height) / f64::from(lh);
+    if (sx - sy).abs() <= 0.05 && sx > 0.0 {
+        sx
+    } else {
+        1.0
+    }
+}
+
+fn default_screenshot_name() -> String {
+    let stamp = glib::DateTime::now_local()
+        .and_then(|now| now.format("%Y%m%d-%H%M%S"))
+        .map(String::from)
+        .unwrap_or_else(|_| "capture".into());
+    format!("PicaLens-{stamp}.png")
+}
+
+fn next_screenshot_path(dir: &Path) -> PathBuf {
+    let base = default_screenshot_name();
+    let candidate = dir.join(&base);
+    if !candidate.exists() {
+        return candidate;
+    }
+    let stem = base.strip_suffix(".png").unwrap_or(&base);
+    for suffix in 1..1000 {
+        let next = dir.join(format!("{stem}-{suffix}.png"));
+        if !next.exists() {
+            return next;
+        }
+    }
+    dir.join(format!("{stem}-{}.png", glib::uuid_string_random()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn computes_portal_crop_scale_and_unique_screenshot_paths() {
+        assert!((frame_crop_scale((1200, 900), Some((800, 600))) - 1.5).abs() < 1e-6);
+        assert_eq!(frame_crop_scale((800, 600), None), 1.0);
+        assert_eq!(frame_crop_scale((1600, 600), Some((800, 600))), 1.0);
+
+        let dir = std::env::temp_dir().join(glib::uuid_string_random().as_str());
+        std::fs::create_dir(&dir).unwrap();
+        let first = next_screenshot_path(&dir);
+        assert!(first.file_name().unwrap().to_str().unwrap().starts_with("PicaLens-"));
+        std::fs::write(&first, b"png").unwrap();
+        let second = next_screenshot_path(&dir);
+        assert_ne!(first, second);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #pragma once
 
+#include <QImage>
 #include <QRectF>
 
 #include <optional>
@@ -37,12 +38,26 @@ struct Presentation {
 
 enum class Layout { Fit, Stretch, Fill };
 
+struct Crop {
+    int left = 0;
+    int top = 0;
+    int right = 0;
+    int bottom = 0;
+
+    bool isEmpty() const
+    {
+        return left == 0 && top == 0 && right == 0 && bottom == 0;
+    }
+};
+
 QRect paintRect(const KWin::RenderViewport &viewport, const QRect &logicalRect);
 void clearGlDamage(const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
                    const Damage &damage);
-std::optional<Presentation> presentationFor(KWin::EffectWindow *window, Layout layout);
+std::optional<Presentation> presentationFor(KWin::EffectWindow *window, Layout layout, Crop crop = {});
 bool paintPresentation(KWin::EffectWindow *window, const Presentation &presentation,
                        const KWin::RenderTarget &target, const KWin::RenderViewport &viewport,
                        const Damage &damage);
+QImage captureDestination(const Presentation &presentation, const KWin::RenderTarget &target,
+                          const KWin::RenderViewport &viewport);
 
 }

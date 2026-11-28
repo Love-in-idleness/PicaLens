@@ -14,6 +14,10 @@
 #include <QMouseEvent>
 #include <QPointer>
 #include <QTimer>
+#include <QVariantMap>
+
+#include <algorithm>
+#include <utility>
 
 #include "cursor.h"
 #include "cursorsource.h"
@@ -72,6 +76,8 @@ public:
                 repaintOutput(m_presentation->outputRect);
             }
         });
+        m_cursorIdleTimer.setSingleShot(true);
+        connect(&m_cursorIdleTimer, &QTimer::timeout, this, &PicaLensEffect::hideIdleCursor);
         connect(effects, &EffectsHandler::windowActivated, this, [this](EffectWindow *active) {
             if (m_presentation && active != m_window) {
                 stop("focus changed");
@@ -112,7 +118,7 @@ public:
         });
         auto *mouse = Cursors::self()->mouse();
         connect(mouse, &Cursor::cursorChanged, this, &PicaLensEffect::updateCursor);
-        connect(mouse, &Cursor::posChanged, this, &PicaLensEffect::updateCursor);
+        connect(mouse, &Cursor::posChanged, this, &PicaLensEffect::onCursorMoved);
         m_fallbackCursor.setShape(Qt::ArrowCursor);
         qInfo("picalens loaded");
     }
@@ -164,6 +170,14 @@ public:
                 });
             }
             return;
+        }
+        if (!m_pendingScreenshotPath.isEmpty() && (!m_gpu || m_gpu->hasFrame())) {
+            const QString path = std::exchange(m_pendingScreenshotPath, {});
+            const QImage image = PicaLens::captureDestination(*m_presentation, target, viewport);
+            const bool saved = !image.isNull() && image.save(path, "PNG");
+            QTimer::singleShot(0, this, [this, path, saved] {
+                Q_EMIT ScreenshotSaved(path, saved);
+            });
         }
 #ifdef PICALENS_KWIN_67
         repaintSoftwareCursor(target, viewport, damage);
@@ -235,6 +249,23 @@ public Q_SLOTS:
         return effects->isOpenGLCompositing() && PicaLens::GpuPresentation::workerAvailable() ? 1 : 0;
     }
 
+    Q_SCRIPTABLE int CapabilitiesVersion() const
+    {
+        return 2;
+    }
+
+    Q_SCRIPTABLE QString ActiveWindowAppId() const
+    {
+        if (!calledFromDBus() || !callerIsOwner()) {
+            return {};
+        }
+        auto *window = effects->activeWindow();
+        if (!window || !eligible(window) || isPicaLensWindow(window)) {
+            return {};
+        }
+        return windowAppId(window);
+    }
+
     Q_SCRIPTABLE bool StartWithLayout(const QString &layout)
     {
         const auto parsed = parseLayout(layout);
@@ -274,6 +305,32 @@ public Q_SLOTS:
             && startActive(layout, *selected, device);
     }
 
+    Q_SCRIPTABLE bool StartWithOptions(const QVariantMap &options)
+    {
+        const auto parsed = parseStartOptions(options);
+        return parsed && startSelection(parsed->layout, parsed->filter, parsed->renderDevice,
+                                        parsed->crop, parsed->hideCursorMs);
+    }
+
+    Q_SCRIPTABLE bool StartActiveWithOptions(const QVariantMap &options)
+    {
+        const auto parsed = parseStartOptions(options);
+        return parsed && startActive(parsed->layout, parsed->filter, parsed->renderDevice,
+                                     parsed->crop, parsed->hideCursorMs);
+    }
+
+    Q_SCRIPTABLE bool CaptureScreenshot(const QString &path)
+    {
+        if (!calledFromDBus()
+            || (!m_owner.watchedServices().contains(message().service()) && !callerIsOwner())
+            || !m_presentation || !m_firstPaint || path.isEmpty() || !m_pendingScreenshotPath.isEmpty()) {
+            return false;
+        }
+        m_pendingScreenshotPath = path;
+        repaintOutput(m_presentation->outputRect);
+        return true;
+    }
+
     Q_SCRIPTABLE void Stop()
     {
         if (calledFromDBus() && m_owner.watchedServices().contains(message().service())) {
@@ -283,25 +340,105 @@ public Q_SLOTS:
 
 Q_SIGNALS:
     Q_SCRIPTABLE void Finished(const QString &reason, bool returnToControls);
+    Q_SCRIPTABLE void ScreenshotSaved(const QString &path, bool ok);
 
 private:
+    struct StartOptions {
+        PicaLens::Layout layout = PicaLens::Layout::Fit;
+        PicaLens::Filter filter = PicaLens::Filter::Linear;
+        QString renderDevice;
+        PicaLens::Crop crop;
+        int hideCursorMs = 0;
+    };
+
+    bool callerIsOwner() const
+    {
+        const auto appId = QStringLiteral("io.github.LoveInIdleness.PicaLens");
+        const auto owner = connection().interface()->serviceOwner(appId);
+        return owner.isValid() && owner.value() == message().service();
+    }
+
+    static bool isPicaLensWindow(EffectWindow *window)
+    {
+        const auto appId = QStringLiteral("io.github.LoveInIdleness.PicaLens");
+        return window->window()->desktopFileName() == appId || window->window()->resourceClass() == appId;
+    }
+
+    static QString windowAppId(EffectWindow *window)
+    {
+        auto *source = window->window();
+        if (!source->desktopFileName().isEmpty()) {
+            return source->desktopFileName();
+        }
+        if (!source->resourceClass().isEmpty()) {
+            return source->resourceClass();
+        }
+        return source->resourceName();
+    }
+
+    std::optional<StartOptions> parseStartOptions(const QVariantMap &options) const
+    {
+        StartOptions parsed;
+        const auto layout = parseLayout(options.value(QStringLiteral("layout"), QStringLiteral("fit")).toString());
+        if (!layout) {
+            return std::nullopt;
+        }
+        parsed.layout = *layout;
+        const QString filterNameStr = options.value(QStringLiteral("filter"), QStringLiteral("linear")).toString();
+        if (filterNameStr == QStringLiteral("linear")) {
+            parsed.filter = PicaLens::Filter::Linear;
+        } else if (const auto gpuFilter = parseGpuFilter(filterNameStr)) {
+            if (!effects->isOpenGLCompositing()) {
+                return std::nullopt;
+            }
+            parsed.filter = *gpuFilter;
+        } else {
+            return std::nullopt;
+        }
+        parsed.renderDevice = options.value(QStringLiteral("renderDevice")).toString();
+        if (parsed.renderDevice.size() > 512) {
+            return std::nullopt;
+        }
+        const bool needsWorker = parsed.filter == PicaLens::Filter::Anime4k
+            || (parsed.filter != PicaLens::Filter::Linear && !parsed.renderDevice.isEmpty());
+        if (needsWorker && RenderWorkerVersion() != 1) {
+            return std::nullopt;
+        }
+        auto clampInt = [&](const char *key, int maxValue) {
+            return std::clamp(options.value(QString::fromLatin1(key)).toInt(), 0, maxValue);
+        };
+        parsed.crop = PicaLens::Crop{
+            clampInt("cropLeft", 4096),
+            clampInt("cropTop", 4096),
+            clampInt("cropRight", 4096),
+            clampInt("cropBottom", 4096),
+        };
+        parsed.hideCursorMs = clampInt("hideCursorMs", 60000);
+        return parsed;
+    }
+
     bool startActive(const QString &layout, PicaLens::Filter filter, const QString &device = {})
     {
         const auto parsed = parseLayout(layout);
-        if (!parsed || !canStart()) {
+        return parsed && startActive(*parsed, filter, device, {}, 0);
+    }
+
+    bool startActive(PicaLens::Layout layout, PicaLens::Filter filter, const QString &device,
+                     PicaLens::Crop crop, int hideCursorMs)
+    {
+        if (!canStart()) {
             return false;
         }
-        const auto appId = QStringLiteral("io.github.LoveInIdleness.PicaLens");
-        const auto owner = connection().interface()->serviceOwner(appId);
         auto *window = effects->activeWindow();
-        if (!owner.isValid() || owner.value() != message().service() || !window || !eligible(window)
-            || window->window()->desktopFileName() == appId || window->window()->resourceClass() == appId) {
+        if (!callerIsOwner() || !window || !eligible(window) || isPicaLensWindow(window)) {
             return false;
         }
         m_owner.addWatchedService(message().service());
-        m_layout = *parsed;
+        m_layout = layout;
         m_filter = filter;
         m_renderDevice = device;
+        m_crop = crop;
+        m_hideCursorMs = hideCursorMs;
         return start(window);
     }
 
@@ -348,7 +485,7 @@ private:
     }
 
     bool startSelection(PicaLens::Layout layout, PicaLens::Filter filter = PicaLens::Filter::Linear,
-                        const QString &device = {})
+                        const QString &device = {}, PicaLens::Crop crop = {}, int hideCursorMs = 0)
     {
         if (!canStart() || !effects->grabKeyboard(this)) {
             return false;
@@ -357,14 +494,55 @@ private:
         m_layout = layout;
         m_filter = filter;
         m_renderDevice = device;
+        m_crop = crop;
+        m_hideCursorMs = hideCursorMs;
         m_selecting = true;
         effects->startMouseInterception(this, Qt::CrossCursor);
         qInfo("picalens selecting an existing window");
         return true;
     }
 
+    void onCursorMoved()
+    {
+        auto *mouse = Cursors::self()->mouse();
+        const QPointF pos = mouse->pos();
+        if (pos != m_lastCursorPos) {
+            m_lastCursorPos = pos;
+            showIdleCursor();
+            if (m_presentation && m_hideCursorMs > 0) {
+                m_cursorIdleTimer.start(m_hideCursorMs);
+            }
+        }
+        updateCursor();
+    }
+
+    void hideIdleCursor()
+    {
+        if (!m_presentation || m_hideCursorMs <= 0 || m_cursorHidden) {
+            return;
+        }
+        auto *mouse = Cursors::self()->mouse();
+        if (!QRectF(m_presentation->outputRect).contains(mouse->pos())) {
+            return;
+        }
+        m_cursorHidden = true;
+        effects->hideCursor();
+    }
+
+    void showIdleCursor()
+    {
+        if (!m_cursorHidden) {
+            return;
+        }
+        m_cursorHidden = false;
+        effects->showCursor();
+    }
+
     void updateCursor()
     {
+        if (m_cursorHidden) {
+            return;
+        }
         auto *mouse = Cursors::self()->mouse();
         auto *source = mouse->source();
         const bool showingFallback = source == &m_fallbackCursor;
@@ -485,9 +663,9 @@ private:
             return false;
         }
         auto *source = window->window();
-        auto presentation = PicaLens::presentationFor(window, m_layout);
+        auto presentation = PicaLens::presentationFor(window, m_layout, m_crop);
         if (!source->surface() || !presentation) {
-            stop("window has no usable presentation");
+            stop(!m_crop.isEmpty() && source->surface() ? "invalid_crop" : "window has no usable presentation");
             return false;
         }
 
@@ -536,6 +714,10 @@ private:
             stop("source destroyed");
         });
         effects->setActiveFullScreenEffect(this);
+        m_lastCursorPos = Cursors::self()->mouse()->pos();
+        if (m_hideCursorMs > 0) {
+            m_cursorIdleTimer.start(m_hideCursorMs);
+        }
         updateCursor();
         repaintOutput(presentation->outputRect);
         qInfo().nospace() << "picalens started protocol=" << (window->isX11Client() ? "xwayland" : "wayland")
@@ -565,6 +747,11 @@ private:
         }
         const QRect repaint = m_presentation->outputRect;
         m_presentation.reset();
+        m_pendingScreenshotPath.clear();
+        m_cursorIdleTimer.stop();
+        showIdleCursor();
+        m_hideCursorMs = 0;
+        m_crop = {};
         m_renderPoll.stop();
         finishRenderWait();
         if (m_gpu) {
@@ -609,6 +796,7 @@ private:
 #endif
     QTimer m_activationTimer;
     QTimer m_renderPoll;
+    QTimer m_cursorIdleTimer;
     QDBusServiceWatcher m_owner;
     ShapeCursorSource m_fallbackCursor;
     QPointer<CursorSource> m_originalCursor;
@@ -617,13 +805,18 @@ private:
     PicaLensInputFilter m_input;
     PicaLens::Layout m_layout = PicaLens::Layout::Fit;
     PicaLens::Filter m_filter = PicaLens::Filter::Linear;
+    PicaLens::Crop m_crop;
     QString m_renderDevice;
+    QString m_pendingScreenshotPath;
+    QPointF m_lastCursorPos;
+    int m_hideCursorMs = 0;
     std::unique_ptr<PicaLens::GpuPresentation> m_gpu;
     bool m_registered = false;
     bool m_selecting = false;
     bool m_firstPaint = false;
     bool m_failedPaint = false;
     bool m_renderGrab = false;
+    bool m_cursorHidden = false;
 };
 
 KWIN_EFFECT_FACTORY_SUPPORTED_ENABLED(PicaLensEffect, "metadata.json",

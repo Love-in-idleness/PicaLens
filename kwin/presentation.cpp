@@ -27,9 +27,13 @@ QRect paintRect([[maybe_unused]] const KWin::RenderViewport &viewport, const QRe
 #endif
 }
 
-std::optional<Presentation> presentationFor(KWin::EffectWindow *window, Layout layout)
+std::optional<Presentation> presentationFor(KWin::EffectWindow *window, Layout layout, Crop crop)
 {
     if (!window || window->isDeleted() || !window->isVisible() || !window->screen()) {
+        return std::nullopt;
+    }
+    if (crop.left < 0 || crop.top < 0 || crop.right < 0 || crop.bottom < 0
+        || crop.left > 4096 || crop.top > 4096 || crop.right > 4096 || crop.bottom > 4096) {
         return std::nullopt;
     }
     auto *output = window->screen();
@@ -37,6 +41,12 @@ std::optional<Presentation> presentationFor(KWin::EffectWindow *window, Layout l
     // On XWayland the frame extents can retain their pre-scale values after
     // an output change. Keep the full client rectangle so its pixels survive.
     QRectF source = window->clientGeometry();
+    if (!crop.isEmpty()) {
+        source.adjust(crop.left, crop.top, -crop.right, -crop.bottom);
+        if (source.width() < 16.0 || source.height() < 16.0) {
+            return std::nullopt;
+        }
+    }
     if (source.isEmpty() || outputRect.isEmpty() || !window->bufferGeometry().contains(source)) {
         return std::nullopt;
     }
@@ -169,6 +179,42 @@ bool paintPresentation(KWin::EffectWindow *window, const Presentation &presentat
     const auto *pixmap = surface->pixmap();
     return pixmap && !pixmap->isDiscarded() && pixmap->texture()->isValid();
 #endif
+}
+
+QImage captureDestination(const Presentation &presentation, const KWin::RenderTarget &target,
+                          const KWin::RenderViewport &viewport)
+{
+#ifdef PICALENS_KWIN_67
+    const QRect device = viewport.transform().map(paintRect(viewport, presentation.destination),
+                                                  target.transformedSize());
+#else
+    const QRect device = viewport.mapToRenderTarget(presentation.destination);
+#endif
+    const QRect bounded = device.intersected(QRect(QPoint(), target.size()));
+    if (bounded.isEmpty()) {
+        return {};
+    }
+    if (target.framebuffer()) {
+        QImage image(bounded.size(), QImage::Format_RGBA8888);
+        if (image.isNull()) {
+            return {};
+        }
+        GLint alignment = 4;
+        glGetIntegerv(GL_PACK_ALIGNMENT, &alignment);
+        glPixelStorei(GL_PACK_ALIGNMENT, 4);
+        glReadPixels(bounded.x(), target.size().height() - bounded.y() - bounded.height(),
+                     bounded.width(), bounded.height(), GL_RGBA, GL_UNSIGNED_BYTE, image.bits());
+        glPixelStorei(GL_PACK_ALIGNMENT, alignment);
+#if QT_VERSION >= QT_VERSION_CHECK(6, 9, 0)
+        return image.flipped(Qt::Vertical);
+#else
+        return image.mirrored(false, true);
+#endif
+    }
+    if (const QImage *surface = target.image()) {
+        return surface->copy(bounded);
+    }
+    return {};
 }
 
 }

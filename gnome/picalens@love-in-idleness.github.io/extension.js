@@ -16,6 +16,7 @@ const LAYOUTS = ['fit', 'fill', 'stretch'];
 const INTERFACE = `<node>
   <interface name="${APP}.Gnome1">
     <method name="GetLayouts"><arg type="as" direction="out"/></method>
+    <method name="GetActiveAppId"><arg type="s" direction="out"/></method>
     <method name="Start">
       <arg name="layout" type="s" direction="in"/>
       <arg name="labels" type="a{ss}" direction="in"/>
@@ -25,10 +26,41 @@ const INTERFACE = `<node>
       <arg name="layout" type="s" direction="in"/>
       <arg name="error" type="s" direction="out"/>
     </method>
+    <method name="StartWithOptions">
+      <arg name="options" type="a{sv}" direction="in"/>
+      <arg name="labels" type="a{ss}" direction="in"/>
+      <arg name="error" type="s" direction="out"/>
+    </method>
+    <method name="StartActiveWithOptions">
+      <arg name="options" type="a{sv}" direction="in"/>
+      <arg name="error" type="s" direction="out"/>
+    </method>
     <method name="Stop"/>
     <signal name="Finished"><arg name="reason" type="s"/></signal>
   </interface>
 </node>`;
+
+function clampInt(value, max) {
+    const number = typeof value === 'number' && Number.isFinite(value) ? Math.trunc(value) : 0;
+    return Math.max(0, Math.min(max, number));
+}
+
+function parseOptions(raw) {
+    const get = key => {
+        const entry = raw?.[key];
+        return entry instanceof GLib.Variant ? entry.deepUnpack() : entry;
+    };
+    return {
+        layout: typeof get('layout') === 'string' ? get('layout') : 'fit',
+        crop: {
+            left: clampInt(get('cropLeft'), 4096),
+            top: clampInt(get('cropTop'), 4096),
+            right: clampInt(get('cropRight'), 4096),
+            bottom: clampInt(get('cropBottom'), 4096),
+        },
+        hideCursorMs: clampInt(get('hideCursorMs'), 60000),
+    };
+}
 
 function eligible(actor) {
     const win = actor.meta_window;
@@ -63,21 +95,38 @@ export default class PicaLensExtension extends Extension {
         return LAYOUTS;
     }
 
+    GetActiveAppIdAsync(_parameters, invocation) {
+        const focused = global.display.focus_window;
+        this._withOwner(invocation, () => {
+            const actor = focused?.get_compositor_private();
+            const appId = actor && global.display.focus_window === focused && eligible(actor)
+                ? (focused.get_gtk_application_id() || focused.get_wm_class() || '')
+                : '';
+            invocation.return_value(new GLib.Variant('(s)', [appId]));
+        });
+    }
+
     StartAsync([layout, labels], invocation) {
-        this._requestStart(layout, labels, invocation);
+        this._requestStart({layout, crop: {left: 0, top: 0, right: 0, bottom: 0}, hideCursorMs: 0}, labels, invocation);
     }
 
     StartActiveAsync([layout], invocation) {
-        this._requestStart(layout, null, invocation);
+        this._requestStart({layout, crop: {left: 0, top: 0, right: 0, bottom: 0}, hideCursorMs: 0}, null, invocation);
     }
 
-    _requestStart(layout, labels, invocation) {
+    StartWithOptionsAsync([options, labels], invocation) {
+        this._requestStart(parseOptions(options), labels, invocation);
+    }
+
+    StartActiveWithOptionsAsync([options], invocation) {
+        this._requestStart(parseOptions(options), null, invocation);
+    }
+
+    _withOwner(invocation, handler) {
         const exported = this._dbus;
         const bus = invocation.get_connection();
         const sender = invocation.get_sender();
-        const focused = labels ? null : global.display.focus_window;
-        // Only the PicaLens owner can request a transform. The shortcut
-        // targets the same focused window once the owner check completes.
+        // Only the PicaLens owner can inspect or transform windows.
         bus.call('org.freedesktop.DBus', '/org/freedesktop/DBus', 'org.freedesktop.DBus',
             'GetNameOwner', new GLib.Variant('(s)', [APP]), new GLib.VariantType('(s)'),
             Gio.DBusCallFlags.NONE, 1000, null, (connection, result) => {
@@ -92,17 +141,24 @@ export default class PicaLensExtension extends Extension {
                         'Only the active PicaLens application can start a session');
                     return;
                 }
-                let error;
-                try {
-                    error = this._dbus === exported && LAYOUTS.includes(layout)
-                        ? this._start(sender, layout, labels, focused) : 'gnome_unavailable';
-                } catch (e) {
-                    logError(e, 'PicaLens window selection');
-                    this._finish('gnome_unavailable');
-                    error = 'gnome_unavailable';
-                }
-                invocation.return_value(new GLib.Variant('(s)', [error]));
+                handler(sender, this._dbus === exported);
             });
+    }
+
+    _requestStart(options, labels, invocation) {
+        const focused = labels ? null : global.display.focus_window;
+        this._withOwner(invocation, (sender, active) => {
+            let error;
+            try {
+                error = active && LAYOUTS.includes(options.layout)
+                    ? this._start(sender, options, labels, focused) : 'gnome_unavailable';
+            } catch (e) {
+                logError(e, 'PicaLens window selection');
+                this._finish('gnome_unavailable');
+                error = 'gnome_unavailable';
+            }
+            invocation.return_value(new GLib.Variant('(s)', [error]));
+        });
     }
 
     StopAsync(_parameters, invocation) {
@@ -115,7 +171,7 @@ export default class PicaLensExtension extends Extension {
         session.signals.push([object, object.connect(signal, callback)]);
     }
 
-    _start(owner, layout, labels, focused) {
+    _start(owner, options, labels, focused) {
         if (this._session || Main.sessionMode.isLocked || Main.overview.visible)
             return 'gnome_unavailable';
 
@@ -132,7 +188,13 @@ export default class PicaLensExtension extends Extension {
                 return 'no_active_window';
         }
 
-        const session = {owner, layout, signals: []};
+        const session = {
+            owner,
+            layout: options.layout,
+            crop: options.crop,
+            hideCursorMs: options.hideCursorMs,
+            signals: [],
+        };
         this._session = session;
         session.watcher = Gio.bus_watch_name_on_connection(Gio.DBus.session, owner,
             Gio.BusNameWatcherFlags.NONE, null, () => this._finish('client disconnected'));
@@ -221,15 +283,26 @@ export default class PicaLensExtension extends Extension {
             this._finish('gnome_source_lost');
             return;
         }
-        const ratioX = monitor.width / frame.width;
-        const ratioY = monitor.height / frame.height;
+        const crop = session.crop ?? {left: 0, top: 0, right: 0, bottom: 0};
+        const source = {
+            x: frame.x + crop.left,
+            y: frame.y + crop.top,
+            width: frame.width - crop.left - crop.right,
+            height: frame.height - crop.top - crop.bottom,
+        };
+        if (source.width < 16 || source.height < 16) {
+            this._finish('invalid_crop');
+            return;
+        }
+        const ratioX = monitor.width / source.width;
+        const ratioY = monitor.height / source.height;
         const uniform = session.layout === 'fill' ? Math.max(ratioX, ratioY) : Math.min(ratioX, ratioY);
         const sx = session.layout === 'stretch' ? ratioX : uniform;
         const sy = session.layout === 'stretch' ? ratioY : uniform;
-        const x = monitor.x + (monitor.width - frame.width * sx) / 2;
-        const y = monitor.y + (monitor.height - frame.height * sy) / 2;
-        const width = Math.min(frame.width, monitor.width / sx);
-        const height = Math.min(frame.height, monitor.height / sy);
+        const x = monitor.x + (monitor.width - source.width * sx) / 2;
+        const y = monitor.y + (monitor.height - source.height * sy) / 2;
+        const width = Math.min(source.width, monitor.width / sx);
+        const height = Math.min(source.height, monitor.height / sy);
         const pivot = actor.get_pivot_point();
         const [scaleX, scaleY] = actor.get_scale();
         const [tx, ty, tz] = actor.get_translation();
@@ -267,10 +340,35 @@ export default class PicaLensExtension extends Extension {
         }
         actor.set_pivot_point(0, 0);
         actor.set_scale(sx, sy);
-        actor.set_translation(x - actor.x + (actor.x - frame.x) * sx,
-            y - actor.y + (actor.y - frame.y) * sy, tz);
-        actor.set_clip(frame.x - actor.x + (frame.width - width) / 2,
-            frame.y - actor.y + (frame.height - height) / 2, width, height);
+        actor.set_translation(x - actor.x + (actor.x - source.x) * sx,
+            y - actor.y + (actor.y - source.y) * sy, tz);
+        actor.set_clip(source.x - actor.x + (source.width - width) / 2,
+            source.y - actor.y + (source.height - height) / 2, width, height);
+
+        const cursorTracker = session.hideCursorMs > 0 ? global.backend?.get_cursor_tracker?.() : null;
+        if (cursorTracker && typeof cursorTracker.inhibit_cursor_visibility === 'function') {
+            session.showCursor = () => {
+                if (session.cursorHidden) {
+                    session.cursorHidden = false;
+                    cursorTracker.uninhibit_cursor_visibility();
+                }
+            };
+            session.armCursorTimer = () => {
+                if (session.cursorTimerId) {
+                    GLib.source_remove(session.cursorTimerId);
+                    session.cursorTimerId = 0;
+                }
+                session.cursorTimerId = GLib.timeout_add(GLib.PRIORITY_DEFAULT, session.hideCursorMs, () => {
+                    session.cursorTimerId = 0;
+                    if (this._session === session && !session.cursorHidden) {
+                        session.cursorHidden = true;
+                        cursorTracker.inhibit_cursor_visibility();
+                    }
+                    return GLib.SOURCE_REMOVE;
+                });
+            };
+            session.armCursorTimer();
+        }
 
         if (index === Main.layoutManager.primaryIndex && Main.layoutManager.panelBox.visible) {
             session.panel = Main.layoutManager.panelBox;
@@ -292,6 +390,12 @@ export default class PicaLensExtension extends Extension {
         });
         this._connect(session, global.stage, 'captured-event', (_stage, event) => {
             const type = event.type();
+            if (session.armCursorTimer && (type === Clutter.EventType.MOTION ||
+                type === Clutter.EventType.BUTTON_PRESS || type === Clutter.EventType.SCROLL ||
+                type === Clutter.EventType.TOUCH_BEGIN)) {
+                session.showCursor();
+                session.armCursorTimer();
+            }
             if (type === Clutter.EventType.KEY_PRESS && event.get_key_symbol() === Clutter.KEY_Escape) {
                 this._finish('Escape');
                 return Clutter.EVENT_STOP;
@@ -318,6 +422,9 @@ export default class PicaLensExtension extends Extension {
             object.disconnect(id);
         if (session.activateId)
             GLib.source_remove(session.activateId);
+        if (session.cursorTimerId)
+            GLib.source_remove(session.cursorTimerId);
+        session.showCursor?.();
         if (session.watcher)
             Gio.bus_unwatch_name(session.watcher);
         if (session.escapeAction) {
