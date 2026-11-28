@@ -20,7 +20,7 @@ pub struct GamePage {
     ids: RefCell<Vec<String>>,
     combo: adw::ComboRow,
     entries: HashMap<&'static str, adw::EntryRow>,
-    choices: [(&'static str, &'static [&'static str], adw::ComboRow); 4],
+    choices: [(&'static str, &'static [&'static str], adw::ComboRow); 5],
     switches: HashMap<&'static str, adw::SwitchRow>,
     status: gtk::Label,
     start: gtk::Button,
@@ -60,6 +60,7 @@ impl GamePage {
             ("mode", gamescope::MODES, &display),
             ("scaler", gamescope::SCALERS, &display),
             ("filter", gamescope::FILTERS, &display),
+            ("orientation", gamescope::ORIENTATIONS, &display),
         ]
         .map(|(key, items, group)| {
             let labels = items.iter().map(|value| t(value)).collect::<Vec<_>>();
@@ -108,8 +109,15 @@ impl GamePage {
                     }
                 });
             }
+            if key == "env_vars" {
+                row.set_tooltip_text(Some(&t("env_vars_hint")));
+            } else if key == "extra_args" {
+                row.set_tooltip_text(Some(&t("extra_args_hint")));
+            }
             if key == "name" {
                 profiles.add(&row);
+            } else if matches!(key, "env_vars" | "extra_args") {
+                advanced.add(&row);
             } else {
                 command.add(&row);
             }
@@ -123,14 +131,93 @@ impl GamePage {
             if key == "fps_limit" {
                 row.set_tooltip_text(Some(&t("fps_limit_hint")));
             }
-            display.add(&row);
+            if matches!(key, "display_index" | "hide_cursor_delay" | "hdr_sdr_nits" | "reshade_technique") {
+                advanced.add(&row);
+            } else {
+                display.add(&row);
+            }
+            entries.insert(key, row);
+        }
+        for &(key, _) in gamescope::FLOATS {
+            let row = adw::EntryRow::builder()
+                .title(t(key))
+                .input_purpose(gtk::InputPurpose::Number)
+                .build();
+            if key == "max_scale" {
+                display.add(&row);
+            } else {
+                advanced.add(&row);
+            }
+            entries.insert(key, row);
+        }
+        let detected_vk = gamescope::detected_vk_devices();
+        for &(key, _) in gamescope::OPTION_TEXT {
+            let row = adw::EntryRow::builder().title(t(key)).build();
+            if key == "vk_device" {
+                let hint = if detected_vk.is_empty() {
+                    t("vk_device_hint")
+                } else {
+                    format!("{} ({})", t("vk_device_hint"), detected_vk.join(", "))
+                };
+                row.set_tooltip_text(Some(&hint));
+                if !detected_vk.is_empty() {
+                    let cycle = gtk::Button::builder()
+                        .icon_name("video-display-symbolic")
+                        .tooltip_text(t("vk_device_pick"))
+                        .valign(gtk::Align::Center)
+                        .build();
+                    row.add_suffix(&cycle);
+                    let devices = detected_vk.clone();
+                    cycle.connect_clicked({
+                        let row = row.downgrade();
+                        move |_| {
+                            let Some(row) = row.upgrade() else { return };
+                            let current = row.text();
+                            let next = devices
+                                .iter()
+                                .position(|id| id == current.trim())
+                                .map_or(0, |index| (index + 1) % devices.len());
+                            row.set_text(&devices[next]);
+                        }
+                    });
+                }
+            } else if key == "reshade_effect" {
+                row.set_tooltip_text(Some(&t("reshade_effect_hint")));
+                let browse = gtk::Button::builder()
+                    .icon_name("folder-open-symbolic")
+                    .tooltip_text(t("browse"))
+                    .valign(gtk::Align::Center)
+                    .build();
+                row.add_suffix(&browse);
+                browse.connect_clicked({
+                    let row = row.downgrade();
+                    let window = window.downgrade();
+                    move |_| {
+                        let (Some(row), Some(window)) = (row.upgrade(), window.upgrade()) else {
+                            return;
+                        };
+                        let picker = gtk::FileDialog::builder()
+                            .title(locale.text(key))
+                            .modal(true)
+                            .build();
+                        glib::spawn_future_local(async move {
+                            if let Ok(file) = picker.open_future(Some(&window)).await
+                                && let Some(path) = file.path()
+                            {
+                                row.set_text(&path.to_string_lossy());
+                            }
+                        });
+                    }
+                });
+            }
+            advanced.add(&row);
             entries.insert(key, row);
         }
         let switches = gamescope::SWITCHES
             .iter()
             .map(|&(id, _)| {
                 let row = adw::SwitchRow::builder().title(t(id)).build();
-                if matches!(id, "hdr" | "vrr") {
+                if matches!(id, "hdr" | "hdr_itm" | "vrr") {
                     row.set_subtitle(&t("display_support_hint"));
                 }
                 advanced.add(&row);
@@ -324,6 +411,7 @@ impl GamePage {
                     let supported = match *key {
                         "scaler" => backend.scaler(id),
                         "filter" => backend.filter(id),
+                        "orientation" => *id == "auto" || backend.has("--force-orientation"),
                         _ => match *id {
                             "fullscreen" => backend.has("--fullscreen"),
                             "borderless" => backend.has("--borderless"),
@@ -370,6 +458,14 @@ impl GamePage {
                 backend.as_ref().is_none_or(|backend| backend.has(flag))
                     && (id != "sharpness" || matches!(filter, Some("fsr" | "nis" | "sgsr"))),
             );
+        }
+        for &(id, flag) in gamescope::FLOATS {
+            self.entries[id]
+                .set_sensitive(backend.as_ref().is_none_or(|backend| backend.has(flag)));
+        }
+        for &(id, flag) in gamescope::OPTION_TEXT {
+            self.entries[id]
+                .set_sensitive(backend.as_ref().is_none_or(|backend| backend.has(flag)));
         }
         for &(id, flag) in gamescope::SWITCHES {
             self.switches[id]
@@ -439,11 +535,18 @@ impl GamePage {
         let Some(backend) = backend.as_ref() else {
             return;
         };
+        let env = match Gamescope::env_vars(&values["env_vars"]) {
+            Ok(env) => env,
+            Err(key) => {
+                self.status(key);
+                return;
+            }
+        };
         match backend.options(|key| values[key].as_str()) {
             Ok(options) => {
                 self.widget
                     .clipboard()
-                    .set_text(&backend.steam_options(&options));
+                    .set_text(&backend.steam_options(&options, &env));
                 self.status("copied_steam");
             }
             Err(key) => self.status(key),
@@ -463,6 +566,13 @@ impl GamePage {
         let Some(backend) = backend.as_ref() else {
             return;
         };
+        let env = match Gamescope::env_vars(&values["env_vars"]) {
+            Ok(env) => env,
+            Err(key) => {
+                self.status(key);
+                return;
+            }
+        };
         let options = match backend.options(|key| values[key].as_str()) {
             Ok(options) => options,
             Err(key) => {
@@ -470,7 +580,7 @@ impl GamePage {
                 return;
             }
         };
-        let child = match backend.spawn(&options, |key| values[key].as_str()) {
+        let child = match backend.spawn(&options, &env, |key| values[key].as_str()) {
             Ok(child) => child,
             Err(error) => {
                 self.report("launch_failed", error.to_string());

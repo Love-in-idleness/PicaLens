@@ -70,8 +70,9 @@ sudo apt install ./picalens_0.2.1-1_amd64.deb
 ### 3. 通过 Gamescope 启动游戏
 
 在 **「启动游戏」** 页可直接调用系统安装的 Gamescope：
-- 支持保存 **Linux 原生** 或 **Wine** 启动配置，也可一键复制含 `%command%` 的 **Steam 启动选项**。
-- 分辨率、滤镜、锐化、限帧、HDR、VRR、MangoApp 等选项会根据本机 Gamescope 版本自动检测可用性。
+- 支持保存 **Linux 原生** 或 **Wine** 启动配置，也可一键复制含环境变量与 `%command%` 的 **Steam 启动选项**。
+- 根据本机 Gamescope 版本自动检测可用性，覆盖分辨率、滤镜、锐化、最大缩放、画面旋转、限帧、首选 Vulkan 显卡（`--prefer-vk-device`）、ReShade 着色器、相对鼠标/光标隐藏/灵敏度、HDR/逆色调映射、VRR、低延迟撕裂、实时调度与 MangoApp 叠加层。
+- 支持自定义 **环境变量（`KEY=VALUE`）** 与 **额外 Gamescope 参数**，便于传递 `DXVK_HUD`、`PROTON_*`、`WINE_WAYLAND` 或其他实验参数。
 - 游戏通过 Gamescope 启动后可独立运行，不受 PicaLens 主窗口关闭影响。详见 [Gamescope 选项说明](https://github.com/ValveSoftware/gamescope#options)。
 
 ### 4. 外观、放大行为与快捷键
